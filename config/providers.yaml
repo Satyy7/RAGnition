@@ -1,0 +1,64 @@
+# Model provider configuration.
+#
+# Every model ID and limit below is a starting point that MUST be confirmed against
+# your own provider consoles (Groq: console.groq.com -> Settings -> Limits).
+# Changing a model or provider is a config edit, never a code change.
+#
+# rpm / tpm are the limits WE enforce client-side (token bucket). Set them at or
+# slightly below the provider's real limits so we slow down before we get 429s.
+
+providers:
+  groq:
+    kind: openai_compat
+    base_url: https://api.groq.com/openai/v1
+    api_key_setting: groq_api_key
+  gemini:
+    kind: openai_compat
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_setting: gemini_api_key
+  openrouter:
+    kind: openai_compat
+    base_url: https://openrouter.ai/api/v1
+    api_key_setting: openrouter_api_key
+  jina:
+    kind: jina
+    base_url: https://api.jina.ai/v1
+    api_key_setting: jina_api_key
+  cohere:
+    kind: cohere
+    base_url: https://api.cohere.com/v2
+    api_key_setting: cohere_api_key
+
+chains:
+  # Tried top to bottom. Groq limits are per model, so falling back to another
+  # Groq model often works before we need a different provider.
+  generator:
+    - { provider: groq, model: openai/gpt-oss-120b, rpm: 30, tpm: 8000 }
+    - { provider: groq, model: llama-3.3-70b-versatile, rpm: 30, tpm: 12000 }
+    - { provider: groq, model: llama-3.1-8b-instant, rpm: 30, tpm: 6000 }
+    - { provider: gemini, model: gemini-2.5-flash, rpm: 10 }
+    - { provider: openrouter, model: "meta-llama/llama-3.3-70b-instruct:free", rpm: 20 }
+
+  # Judge should come from a DIFFERENT model family than the generator that
+  # answered (self-preference bias). Enforced per eval run in M13.
+  judge:
+    - { provider: gemini, model: gemini-2.5-flash, rpm: 10 }
+    - { provider: groq, model: llama-3.3-70b-versatile, rpm: 30, tpm: 12000 }
+
+  # Exactly ONE model: vectors from different embedding models live in different
+  # spaces and must never be mixed in one index. Rate limits => wait, not fall back.
+  embedding:
+    - { provider: gemini, model: gemini-embedding-001, dimensions: 768, rpm: 5, batch_size: 32 }
+
+  # If every reranker fails we return the fused order marked degraded=true.
+  rerank:
+    - { provider: jina, model: jina-reranker-v2-base-multilingual, rpm: 60 }
+    - { provider: cohere, model: rerank-v3.5, rpm: 10 }
+
+resilience:
+  max_retries_per_model: 2      # retries on the SAME model for transient errors
+  backoff_base_s: 0.5           # exponential backoff: base * 2^attempt, full jitter
+  backoff_max_s: 8.0
+  max_inline_wait_s: 5.0        # a 429 asking us to wait <= this: wait and retry same model
+  breaker_failure_threshold: 3  # consecutive failures before a model is skipped
+  breaker_cooldown_s: 60.0

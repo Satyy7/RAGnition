@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Data: raw third-party content is never committed (licensing), caches are local
+data/raw/
+data/cache/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Frontend (added in M11)
+node_modules/
+.next/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
