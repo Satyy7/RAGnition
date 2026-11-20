@@ -89,6 +89,16 @@ async def test_embeddings_reorder_by_index_and_check_dimensions():
     assert resp.dimensions == 2
 
 
+async def test_embeddings_without_index_keep_response_order():
+    with respx.mock:
+        respx.post(f"{BASE}/embeddings").mock(
+            return_value=httpx.Response(200, json={"data": [{"embedding": [1.0, 0.0]}, {"embedding": [0.0, 1.0]}]})
+        )
+        async with httpx.AsyncClient() as http:
+            resp = await embed_texts(http, slot(), ["first", "second"], "document")
+    assert resp.vectors == [[1.0, 0.0], [0.0, 1.0]]
+
+
 async def test_embedding_count_mismatch_is_rejected():
     with respx.mock:
         respx.post(f"{BASE}/embeddings").mock(

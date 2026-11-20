@@ -143,6 +143,8 @@ class FallbackExecutor:
 
         if use_cache and self.cache is not None:
             for slot in slots:
+                if not slot.spec.cache:
+                    continue
                 hit = self.cache.get(self._key(slot, payload))
                 if hit is not None:
                     response = response_type.model_validate_json(hit)
@@ -152,7 +154,7 @@ class FallbackExecutor:
 
         attempts: list[AttemptRecord] = []
         for slot in slots:
-            if slot.api_key is None:
+            if slot.provider.api_key_setting is not None and slot.api_key is None:
                 attempts.append(AttemptRecord(slot=slot.id, outcome="no_api_key"))
                 continue
             if not slot.breaker.allow():
@@ -163,7 +165,7 @@ class FallbackExecutor:
             result = await self._try_slot(slot, call, est_tokens, attempts)
             if result is not None:
                 result.attempts = attempts
-                if use_cache and self.cache is not None:
+                if use_cache and self.cache is not None and slot.spec.cache:
                     self.cache.put(
                         self._key(slot, payload),
                         namespace=self.role,

@@ -13,11 +13,20 @@ from typing import Self
 
 import httpx
 
-from ragnition.core.config import ModelSpec, ProvidersConfig, Role, Settings, get_settings, load_providers_config
+from ragnition.core.config import (
+    ModelSpec,
+    ProvidersConfig,
+    Role,
+    Settings,
+    get_settings,
+    load_providers_config,
+    tls_verify,
+)
 from ragnition.core.providers.cache import CallCache
 from ragnition.core.providers.chat import chat_completion
 from ragnition.core.providers.embeddings import InputType, embed_texts
 from ragnition.core.providers.fallback import CircuitBreaker, FallbackExecutor, ModelSlot
+from ragnition.core.providers.local import LocalModels
 from ragnition.core.providers.ratelimit import TokenBucket
 from ragnition.core.providers.rerank import rerank_documents
 from ragnition.core.providers.types import (
@@ -51,7 +60,9 @@ class ModelGateway:
         self.settings = settings
         self.config = config
         self.cache = cache
-        self.http = http or httpx.AsyncClient()
+        self.http = http or httpx.AsyncClient(verify=tls_verify(settings))
+        # Models load lazily on first use, so creating this costs nothing.
+        self.local = LocalModels(settings.model_cache_dir, settings.use_system_certs)
         # Limits are per model (per org), so if two roles use the same model they
         # must share ONE limiter and breaker: key everything by slot id.
         self._shared: dict[str, tuple[TokenBucket | None, TokenBucket | None, CircuitBreaker]] = {}
@@ -110,12 +121,15 @@ class ModelGateway:
         executor = self.executor("embedding")
         spec = executor.slots[0].spec
         vectors: list[list[float]] = []
+        attempts: list = []
+        latency_ms = 0.0
+        all_cached = True
         last: EmbeddingResponse | None = None
         for start in range(0, len(texts), spec.batch_size):
             batch = texts[start : start + spec.batch_size]
 
             async def call(slot: ModelSlot, batch: list[str] = batch) -> EmbeddingResponse:
-                return await embed_texts(self.http, slot, batch, input_type)
+                return await embed_texts(self.http, slot, batch, input_type, self.local)
 
             last = await executor.run(
                 payload={"texts": batch, "input_type": input_type, "dimensions": spec.dimensions},
@@ -124,10 +138,20 @@ class ModelGateway:
                 use_cache=use_cache,
             )
             vectors.extend(last.vectors)
+            attempts.extend(last.attempts)
+            latency_ms += last.latency_ms
+            all_cached = all_cached and last.cached
         if last is None:
             return EmbeddingResponse(vectors=[], dimensions=spec.dimensions or 0, provider=spec.provider, model=spec.model)
+        # Merge per-batch metadata so timing and the attempt trail survive batching.
         return EmbeddingResponse(
-            vectors=vectors, dimensions=last.dimensions, provider=last.provider, model=last.model
+            vectors=vectors,
+            dimensions=last.dimensions,
+            provider=last.provider,
+            model=last.model,
+            latency_ms=latency_ms,
+            cached=all_cached,
+            attempts=attempts,
         )
 
     async def rerank(
@@ -138,7 +162,7 @@ class ModelGateway:
             return RerankResponse(results=[], provider="none", model="none")
 
         async def call(slot: ModelSlot) -> RerankResponse:
-            return await rerank_documents(self.http, slot, query, documents, top_n)
+            return await rerank_documents(self.http, slot, query, documents, top_n, self.local)
 
         try:
             return await self.executor("rerank").run(

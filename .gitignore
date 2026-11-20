@@ -15,6 +15,7 @@ build/
 # Data: raw third-party content is never committed (licensing), caches are local
 data/raw/
 data/cache/
+data/models/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

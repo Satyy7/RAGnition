@@ -9,6 +9,7 @@ mid-request.
 
 from __future__ import annotations
 
+import ssl
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -24,9 +25,16 @@ Role = Literal["generator", "judge", "embedding", "rerank"]
 
 
 class ProviderSpec(BaseModel):
-    kind: Literal["openai_compat", "jina", "cohere"]
-    base_url: str
-    api_key_setting: str  # name of the Settings field holding this provider's key
+    kind: Literal["openai_compat", "jina", "cohere", "local"]
+    base_url: str = ""
+    # Name of the Settings field holding this provider's key. None = no key needed (local).
+    api_key_setting: str | None = None
+
+    @model_validator(mode="after")
+    def _remote_needs_url_and_key(self) -> ProviderSpec:
+        if self.kind != "local" and (not self.base_url or not self.api_key_setting):
+            raise ValueError(f"provider kind '{self.kind}' requires base_url and api_key_setting")
+        return self
 
 
 class ModelSpec(BaseModel):
@@ -37,6 +45,9 @@ class ModelSpec(BaseModel):
     timeout_s: float = Field(default=60.0, gt=0)
     dimensions: int | None = Field(default=None, gt=0)  # embeddings only
     batch_size: int = Field(default=32, ge=1)  # embeddings only
+    # Cache responses on disk? Worth it for remote calls (quota); not for cheap,
+    # deterministic local models whose vectors would just fill the disk.
+    cache: bool = True
 
     @property
     def slot_id(self) -> str:
@@ -85,6 +96,12 @@ class Settings(BaseSettings):
     log_json: bool = True
     providers_config_path: Path = PROJECT_ROOT / "config" / "providers.yaml"
     cache_path: Path = PROJECT_ROOT / "data" / "cache" / "model_calls.sqlite3"
+    # Corporate networks often re-sign HTTPS with a company root certificate that
+    # lives in the OS trust store but not in Python's certifi bundle.
+    use_system_certs: bool = False
+    # Where local model files (ONNX weights, tokenizers) are downloaded. Machine-
+    # specific, so it lives in the environment (e.g. D:\ragnition\models).
+    model_cache_dir: Path = PROJECT_ROOT / "data" / "models"
 
     # SecretStr hides the value in repr()/logs: print(settings) shows '**********'.
     groq_api_key: SecretStr | None = None
@@ -93,8 +110,10 @@ class Settings(BaseSettings):
     cohere_api_key: SecretStr | None = None
     openrouter_api_key: SecretStr | None = None
 
-    def secret(self, setting_name: str) -> str | None:
-        """Return a key's plain value, or None if it is unset or blank."""
+    def secret(self, setting_name: str | None) -> str | None:
+        """Return a key's plain value, or None if it is unset, blank, or not needed."""
+        if setting_name is None:
+            return None
         if setting_name not in type(self).model_fields:
             raise ValueError(f"unknown settings field '{setting_name}'")
         value = getattr(self, setting_name)
@@ -102,6 +121,21 @@ class Settings(BaseSettings):
             plain = value.get_secret_value().strip()
             return plain or None
         return None
+
+
+def tls_verify(settings: Settings) -> ssl.SSLContext | bool:
+    """What to pass as httpx's `verify=`.
+
+    True  -> httpx default: verify against the certifi bundle.
+    SSLContext from truststore -> verify against the OS trust store (Windows
+    certificate store here), which includes corporate root certificates.
+    Verification is never disabled.
+    """
+    if not settings.use_system_certs:
+        return True
+    import truststore  # imported lazily: only needed when opted in
+
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
 
 def load_providers_config(path: Path) -> ProvidersConfig:

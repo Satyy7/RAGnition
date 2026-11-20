@@ -47,6 +47,11 @@ Every LLM, embedding and rerank call goes through `ModelGateway`, which provides
 - a **SQLite call cache**, so repeated identical calls are free;
 - an **attempt trail** on every response that records which model actually answered.
 
+Model placement: small encoder models run **locally** (CPU, ONNX via `fastembed`):
+`BAAI/bge-base-en-v1.5` for embeddings and `BAAI/bge-reranker-base` for reranking.
+Large generative models (generator, judge) use free-tier **APIs**. Local models are
+downloaded once (~1.5 GB) into `MODEL_CACHE_DIR`.
+
 The embedding chain is deliberately a single model: vectors from different models
 cannot share an index. When every reranker fails, results keep their fused order
 and are marked `degraded`.

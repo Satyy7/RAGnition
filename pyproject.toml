@@ -9,6 +9,8 @@ dependencies = [
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
     "pyyaml>=6.0.2,<7",
+    "truststore>=0.10",
+    "fastembed>=0.6",
 ]
 
 [dependency-groups]
@@ -28,4 +30,5 @@ packages = ["backend/ragnition"]
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra"
