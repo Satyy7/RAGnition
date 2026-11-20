@@ -55,3 +55,31 @@ downloaded once (~1.5 GB) into `MODEL_CACHE_DIR`.
 The embedding chain is deliberately a single model: vectors from different models
 cannot share an index. When every reranker fails, results keep their fused order
 and are marked `degraded`.
+
+## Data (M2)
+
+```powershell
+uv run python scripts/build_synthetic.py   # Kestrel Commerce corpus + eval files (~19 Groq calls)
+uv run python scripts/fetch_sources.py     # public sources into data/raw (gitignored)
+uv run python scripts/data_report.py       # licenses, integrity and leakage audit
+```
+
+The corpus has two parts:
+
+- **Kestrel Commerce (synthetic).** A fictional retailer: 9 services, a change log,
+  10 past postmortems and a runbook per service. The facts are hand-written in
+  `data/synthetic/world.yaml`; an LLM only writes the prose. Every document is
+  labelled `SYNTHETIC`.
+- **Public references.** Kubernetes docs (CC BY 4.0), Google SRE book chapters
+  (CC BY-NC-ND 4.0, local use only) and public company postmortems (all rights
+  reserved, local use only). Raw files are never committed.
+
+`data/eval/` holds 12 new incidents and their true root causes (10 answerable,
+including multi-hop ones, and 2 with no evidence, where the right answer is
+"not enough evidence"). The answers are never in the corpus: the corpus holds the
+evidence (change records, similar past incidents, service notes) and RAGnition
+has to connect it. `ensure_corpus_path` refuses any file under `data/eval`, and
+`data_report.py` checks that no corpus document contains an answer.
+
+`data/manifest.jsonl` records every document's source, license, redistribution
+flag and SHA-256.

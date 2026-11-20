@@ -1,0 +1,464 @@
+# SYNTHETIC DATA. Kestrel Commerce is a fictional company. Every service, person,
+# incident and change below is invented for RAGnition's corpus.
+#
+# This file is what the company KNOWS: its services, its past incidents, and its
+# change log. It becomes corpus documents. It must never contain the answers to
+# the evaluation incidents in data/eval/scenarios.yaml: the change log records
+# what was changed, in neutral words, never "this caused the outage".
+
+company:
+  name: Kestrel Commerce
+  description: >-
+    Fictional online retailer of home goods selling in the EU and US, about 40k
+    orders per day, peaking around 9x normal traffic during seasonal sales.
+  environment: >-
+    One production Kubernetes cluster (prod-eu1, 48 nodes) running all services,
+    managed PostgreSQL 15 behind PgBouncer, Redis 7, Kafka 3.7, OpenSearch 2.x.
+    Deploys go through Argo CD; configuration lives in Helm values in the
+    platform-config repository.
+
+services:
+  - id: web-storefront
+    team: Storefront
+    language: TypeScript (Next.js, server-side rendering)
+    description: Customer-facing website. Renders product, search, cart and checkout pages.
+    depends_on: [catalog-api, search-api, checkout-api]
+    external: [CDN (edge cache for static assets and images)]
+    slo: 99.9% of page renders under 1.5 s (p95)
+    config_notes:
+      - SSR upstream timeout is 3 s per backend call.
+      - Static images are served from the CDN; origin is an object storage bucket.
+    known_failure_modes:
+      - Slow upstream APIs make server-side rendering time out and return 504.
+      - CDN cache rules misconfigured so prices or assets are stale.
+
+  - id: checkout-api
+    team: Checkout
+    language: Java 21 (Spring Boot)
+    description: Cart and checkout orchestration. Holds carts in Redis, reserves stock, takes payment, emits orders.
+    depends_on: [inventory-api, payments-api]
+    datastores: ["cart-cache: Redis 7, maxmemory 4 GB, maxmemory-policy volatile-lru"]
+    slo: 99.95% successful checkout requests; p95 latency under 800 ms
+    config_notes:
+      - Carts are Redis keys `cart:{session}`; the platform rule is that every key carries a TTL (carts 7 days).
+      - Calls inventory-api `GET /v2/availability` before reserving stock and maps the JSON response to a strict DTO (unknown or missing required fields fail deserialization).
+    known_failure_modes:
+      - Redis memory pressure; behaviour depends on the eviction policy and on keys having TTLs.
+      - Downstream schema changes break response parsing.
+      - Payment timeouts cause abandoned checkouts.
+
+  - id: payments-api
+    team: Payments
+    language: Go 1.23
+    description: Authorizes and captures card payments through the Paygate payment service provider.
+    depends_on: []
+    datastores: ["payments-db: PostgreSQL 15 via PgBouncer (transaction pooling)"]
+    external: ["Paygate PSP over mutual TLS (client certificate + Paygate server chain verified against a pinned trust bundle)"]
+    slo: 99.95% successful authorizations; p99 under 2 s
+    config_notes:
+      - 6 replicas, each with a database pool of max 20 connections (120 client connections at full load); steady-state peak uses about 40 server connections.
+      - PgBouncer `default_pool_size` is the number of real server connections per database/user pair.
+      - The Paygate trust bundle is a ConfigMap `paygate-ca-bundle` updated by hand.
+      - The Paygate client certificate is issued and renewed by cert-manager (since PM-2025-015).
+    known_failure_modes:
+      - Connection waits at PgBouncer when client demand exceeds the server pool.
+      - TLS failures towards Paygate (expired client certificate, untrusted server chain).
+      - Paygate latency spikes.
+
+  - id: inventory-api
+    team: Fulfilment
+    language: Python 3.12 (FastAPI)
+    description: Stock levels and reservations. Serves availability queries and runs the reservation consumer.
+    depends_on: [catalog-api]
+    datastores: ["inventory-db: PostgreSQL 15", "Kafka topic inventory-reservations (consumer group inventory-reserver, 12 partitions)"]
+    slo: availability p95 under 150 ms; reservation lag under 60 s
+    config_notes:
+      - Reservation consumer settings max.poll.records=500, max.poll.interval.ms=300000 (5 minutes).
+      - If one poll batch takes longer than max.poll.interval.ms, the consumer is removed from the group and partitions are rebalanced.
+      - Public API `/v2/availability` is consumed by checkout-api.
+    known_failure_modes:
+      - Slow per-message processing causes rebalance loops and growing consumer lag.
+      - Breaking API changes affect checkout-api.
+
+  - id: catalog-api
+    team: Catalog
+    language: Kotlin (Ktor)
+    description: Product, variant and price data; source of truth for the search index.
+    depends_on: []
+    datastores: ["catalog-db: PostgreSQL 15 (table product_variant ~42M rows)"]
+    slo: p95 under 200 ms
+    config_notes:
+      - Variant lookups by SKU (`WHERE sku = $1`) are the hottest query (cart and checkout pages).
+      - Schema migrations are Flyway scripts applied on deploy.
+    known_failure_modes:
+      - Missing or unusable indexes cause sequential scans on product_variant.
+      - Long migrations lock tables.
+
+  - id: search-api
+    team: Search
+    language: Java 21
+    description: Product search and the search-indexer job that writes catalog updates into OpenSearch.
+    depends_on: [catalog-api]
+    datastores: ["OpenSearch cluster search-prod: 3 data nodes, 500 GB disk each; indices products-*, search-querylog-*"]
+    slo: search p95 under 300 ms; catalog changes searchable within 5 minutes
+    config_notes:
+      - OpenSearch disk watermarks are defaults (low 85%, high 90%, flood_stage 95%).
+      - At flood_stage OpenSearch puts index.blocks.read_only_allow_delete on indices with a shard on that node.
+      - The query log indices search-querylog-* are managed by an index lifecycle policy (retention setting).
+    known_failure_modes:
+      - Disk watermarks reached, so shards stay unassigned (high) or indices are write-blocked (flood stage).
+      - Indexer backlog makes search results stale.
+
+  - id: order-worker
+    team: Fulfilment
+    language: Python 3.12
+    description: Consumes the orders topic, builds fulfilment documents and pushes them to the warehouse system.
+    depends_on: [inventory-api, notification-service]
+    datastores: ["Kafka topic orders"]
+    slo: orders handed to warehouse within 10 minutes
+    config_notes:
+      - Kubernetes resources in Helm values `order-worker.resources` (requests and limits).
+      - Peak resident memory measured at about 700 MB during sale traffic (PM-2026-005).
+    known_failure_modes:
+      - OOMKilled (exit code 137) when the memory limit is below peak usage, leading to CrashLoopBackOff.
+
+  - id: notification-service
+    team: Customer Comms
+    language: Node.js 22
+    description: Sends order confirmation and shipping emails through the PostRelay email API.
+    depends_on: []
+    external: ["PostRelay email API: account limit 100 messages/s; returns HTTP 429 with Retry-After when exceeded"]
+    slo: confirmation email sent within 5 minutes of order
+    config_notes:
+      - Marketing campaigns share the same PostRelay account and limit.
+      - Retry policy must honour Retry-After and use exponential backoff with jitter (PM-2026-004).
+    known_failure_modes:
+      - Provider throttling (429) and retry amplification build a send backlog.
+
+  - id: cluster-dns
+    team: Platform
+    language: CoreDNS 1.11 (Kubernetes add-on)
+    description: In-cluster DNS for service discovery in prod-eu1.
+    depends_on: []
+    slo: lookup p99 under 50 ms
+    config_notes:
+      - Pods use the default ndots:5, so one external or partially-qualified lookup can become up to 5 DNS queries.
+      - Replica count is managed by the cluster-proportional-autoscaler (min 6).
+    known_failure_modes:
+      - CoreDNS CPU saturation causes lookup timeouts in every service at once.
+
+# ------------------------------------------------------------------ change log
+changes:
+  - {id: CHG-2101, date: "2025-03-11", service: payments-api, kind: config, team: Payments,
+     summary: "Scale payments-api from 6 to 12 replicas for the spring sale",
+     details: "Temporary HPA minimum raised to 12. Reverted on 2025-03-20."}
+  - {id: CHG-2150, date: "2025-08-04", service: payments-api, kind: infra, team: Payments,
+     summary: "Paygate client certificate renewal moved to cert-manager",
+     details: "Certificate paygate-client now issued by cert-manager with 30-day renewal window. Follow-up of PM-2025-015."}
+  - {id: CHG-2201, date: "2026-02-02", service: checkout-api, kind: config, team: Checkout,
+     summary: "cart-cache maxmemory-policy changed from allkeys-lru to volatile-lru",
+     details: "Only keys with an expiry are evicted now. Follow-up of PM-2026-002. Rule added to the platform handbook: every Redis key must have a TTL."}
+  - {id: CHG-2215, date: "2026-03-18", service: notification-service, kind: deploy, team: Customer Comms,
+     summary: "notification-service v2.1: retry with exponential backoff and Retry-After",
+     details: "Sender retries 429 and 5xx responses with exponential backoff (base 1 s, cap 60 s, full jitter) and honours Retry-After. Follow-up of PM-2026-004."}
+  - {id: CHG-2240, date: "2026-05-06", service: order-worker, kind: config, team: Fulfilment,
+     summary: "order-worker memory limit raised from 512Mi to 1Gi",
+     details: "Follow-up of PM-2026-005. Peak RSS measured at about 700 MB with large gift-message orders."}
+  - {id: CHG-2290, date: "2026-10-14", service: web-storefront, kind: deploy, team: Storefront,
+     summary: "web-storefront v14.2: new product gallery component",
+     details: "Lazy-loads gallery images; no backend changes."}
+  - {id: CHG-2302, date: "2026-10-21", service: payments-api, kind: vendor-notice, team: Payments, status: scheduled,
+     summary: "Paygate notice: server certificate chain moves to new intermediate CA",
+     details: "Paygate will serve certificates issued by intermediate 'Paygate Issuing CA G3' (replacing G2) from 2026-11-14 09:00 UTC. Partners that pin intermediates must add G3 to their trust bundle before that date. Ticket PAY-881 created to update ConfigMap paygate-ca-bundle; not yet applied."}
+  - {id: CHG-2305, date: "2026-10-23", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.4: price history endpoint",
+     details: "Adds GET /v1/products/{id}/price-history. Read-only, no schema change."}
+  - {id: CHG-2309, date: "2026-10-28", service: search-api, kind: config, team: Search,
+     summary: "search-querylog-* retention increased from 7 to 90 days",
+     details: "Requested by the analytics team for relevance tuning. Index lifecycle policy querylog-ilm updated; existing indices keep ageing under the new policy. Query log volume is about 18 GB per day per replica set."}
+  - {id: CHG-2312, date: "2026-10-30", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.7.2: dependency updates",
+     details: "Spring Boot patch release and Jackson patch release. No functional changes."}
+  - {id: CHG-2318, date: "2026-11-03", service: payments-api, kind: config, team: Platform,
+     summary: "PgBouncer default_pool_size for payments-db lowered from 60 to 25",
+     details: "Frees server connections on the shared PostgreSQL instance for the new nightly reconciliation job (analytics user). Applied via platform-config PR #4127."}
+  - {id: CHG-2321, date: "2026-11-05", service: catalog-api, kind: migration, team: Catalog,
+     summary: "Flyway V87: consolidate product_variant indexes",
+     details: "Drops idx_variant_sku and idx_variant_product; creates composite idx_variant_product_sku (product_id, sku). Reduces index storage by about 9 GB."}
+  - {id: CHG-2325, date: "2026-11-06", service: inventory-api, kind: deploy, team: Fulfilment,
+     summary: "inventory-api v3.12: reservation enrichment",
+     details: "Reservation consumer now fetches package dimensions from catalog-api for each reserved line (one HTTP call per message, about 700-900 ms each under load) to support carrier selection."}
+  - {id: CHG-2328, date: "2026-11-07", service: notification-service, kind: deploy, team: Customer Comms,
+     summary: "notification-service v2.4: migrate to shared http-client library",
+     details: "Replaces the in-house sender with the shared http-client library. Library default retry policy: up to 5 immediate retries on any non-2xx response."}
+  - {id: CHG-2330, date: "2026-11-09", service: order-worker, kind: deploy, team: Fulfilment,
+     summary: "order-worker v4.6: warehouse API client update",
+     details: "New warehouse SDK version. No resource changes."}
+  - {id: CHG-2331, date: "2026-11-10", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.8.0: CartStore refactor",
+     details: "Cart persistence moved to the new CartStore class. Carts are written with plain SET; expiry handling moves to a background cleaner job that ships disabled behind flag cart-cleaner (planned for v5.9)."}
+  - {id: CHG-2333, date: "2026-11-10", service: inventory-api, kind: deploy, team: Fulfilment,
+     summary: "inventory-api v3.13: availability response v2 cleanup",
+     details: "In /v2/availability the deprecated field available_qty is removed; consumers should read quantity_available (added in v3.8). Changelog entry posted in #fulfilment-releases."}
+  - {id: CHG-2336, date: "2026-11-11", service: cluster-dns, kind: infra, team: Platform,
+     summary: "CoreDNS replicas fixed at 2; proportional autoscaler disabled",
+     details: "Cost review item COST-77. Average CoreDNS CPU was under 10% outside sale periods."}
+  - {id: CHG-2338, date: "2026-11-11", service: search-api, kind: deploy, team: Search,
+     summary: "search-api v6.3: synonym dictionary update",
+     details: "Adds 1,200 synonyms for home textiles. Query-time only."}
+  - {id: CHG-2340, date: "2026-11-12", service: order-worker, kind: config, team: Fulfilment,
+     summary: "order-worker resources right-sized after cost review",
+     details: "Helm values: requests cpu 250m (was 500m), memory limit 512Mi (was 1Gi). Based on average usage over October."}
+  - {id: CHG-2342, date: "2026-11-13", service: web-storefront, kind: config, team: Storefront,
+     summary: "CDN: cache TTL for /static raised to 30 days",
+     details: "Static bundles are content-hashed, so longer TTL is safe."}
+  - {id: CHG-2344, date: "2026-11-13", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.5: Kotlin 2.1 upgrade",
+     details: "Compiler and runtime upgrade; no API changes."}
+
+# ------------------------------------------------------------- past incidents
+history:
+  - id: PM-2025-007
+    date: "2025-03-14"
+    service: payments-api
+    severity: SEV1
+    title: Payment authorizations failing during spring sale
+    duration_min: 47
+    impact: About 18% of payment authorizations failed with HTTP 503 for 47 minutes at sale peak.
+    detection: Alert PaymentsErrorRateHigh fired at 19:02; customers reported failed payments.
+    trigger: payments-api was scaled to 12 replicas for the sale (CHG-2101), doubling client connection demand.
+    root_cause: >-
+      Peak concurrent demand from 12 replicas (up to 240 client connections) far exceeded PgBouncer
+      default_pool_size of 30 server connections.
+      Requests queued waiting for a server connection at PgBouncer (cl_waiting climbed above 150)
+      and timed out in payments-api after 5 s, which returned 503.
+    resolution: PgBouncer default_pool_size raised from 30 to 60 and replicas reduced to 8.
+    contributing_factors:
+      - No alert on PgBouncer cl_waiting.
+      - Capacity plan scaled the application but not the connection pooler.
+    timeline:
+      - "19:00 sale traffic ramps up"
+      - "19:02 PaymentsErrorRateHigh fires"
+      - "19:15 logs show 'timeout acquiring connection from pool'"
+      - "19:31 PgBouncer SHOW POOLS shows cl_waiting 160"
+      - "19:49 replicas reduced, errors recover"
+    action_items:
+      - Alert when PgBouncer cl_waiting > 0 for 2 minutes (done).
+      - Capacity rule - replicas x app pool size must fit within default_pool_size plus headroom (done, in runbook).
+    related_changes: [CHG-2101]
+
+  - id: PM-2025-011
+    date: "2025-06-02"
+    service: search-api
+    severity: SEV2
+    title: Search cluster yellow, new products missing from search
+    duration_min: 190
+    impact: New and updated products did not appear in search for about 3 hours; search itself stayed up.
+    detection: SearchIndexLag alert after 40 minutes.
+    trigger: A reindex of products-* created a full second copy of the index.
+    root_cause: >-
+      The temporary duplicate index pushed two data nodes over the 90% high disk watermark, so OpenSearch
+      stopped allocating shards to them; replicas of new indices stayed unassigned and indexing stalled.
+    resolution: Deleted the old index after alias switch; disk returned to 61%.
+    contributing_factors:
+      - No disk usage alert below the watermark.
+    timeline:
+      - "10:05 reindex job started"
+      - "10:48 SearchIndexLag fires"
+      - "11:30 _cluster/allocation/explain shows high watermark exceeded"
+      - "13:15 old index deleted, shards allocate"
+    action_items:
+      - Alert on data node disk above 80% (done).
+      - Reindex runbook - check free disk is at least 2x index size first (done).
+
+  - id: PM-2025-015
+    date: "2025-07-21"
+    service: payments-api
+    severity: SEV1
+    title: All payments failing - Paygate client certificate expired
+    duration_min: 64
+    impact: 100% of payment authorizations failed for 64 minutes.
+    detection: PaymentsErrorRateHigh at 00:01 UTC.
+    trigger: The client certificate used for mutual TLS with Paygate expired at 00:00 UTC.
+    root_cause: >-
+      The Paygate client certificate was renewed manually once a year; the calendar reminder went to a
+      former employee. Paygate rejected the TLS handshake with 'certificate expired'.
+    resolution: Emergency renewal via Paygate portal; secret updated and pods restarted.
+    contributing_factors:
+      - Manual renewal process with a single owner.
+      - No expiry monitoring for external certificates.
+    timeline:
+      - "00:00 certificate expires"
+      - "00:01 PaymentsErrorRateHigh fires; logs show 'remote error: tls: expired certificate'"
+      - "00:40 new certificate issued"
+      - "01:04 pods restarted, recovery"
+    action_items:
+      - Move Paygate client certificate to cert-manager (done, CHG-2150).
+      - Alert 21 days before any certificate in payments-api expires, including trust bundle entries (done).
+      - Review vendor notices for certificate and CA changes in the weekly Payments sync (done).
+
+  - id: PM-2025-019
+    date: "2025-09-09"
+    service: inventory-api
+    severity: SEV2
+    title: Stock reservations delayed by up to 2 hours
+    duration_min: 140
+    impact: Orders were accepted but stock reservations lagged by up to 2 hours; 312 orders oversold.
+    detection: ReservationLagHigh alert.
+    trigger: An inventory-db slow query (missing statistics after bulk import) made each message take about 1 s.
+    root_cause: >-
+      With max.poll.records=500, one poll batch took about 500 s, longer than max.poll.interval.ms
+      (300 s). The consumer was removed from the group, partitions rebalanced, the uncommitted batch
+      was re-delivered, and the cycle repeated, so lag only grew.
+    resolution: ANALYZE on inventory-db restored query speed; lag drained in 25 minutes.
+    contributing_factors:
+      - Batch size chosen without considering worst-case per-message time.
+    timeline:
+      - "14:10 bulk import finishes"
+      - "14:25 ReservationLagHigh fires"
+      - "14:50 logs show CommitFailedError and repeated rebalances"
+      - "16:05 ANALYZE run, processing time drops to 20 ms"
+    action_items:
+      - Reduce max.poll.records to 50 (FUL-312, open - deprioritised).
+      - Alert on consumer group rebalance rate (done).
+
+  - id: PM-2025-022
+    date: "2025-11-28"
+    service: cluster-dns
+    severity: SEV2
+    title: Intermittent timeouts across services on Black Friday
+    duration_min: 55
+    impact: 2-4% of requests across many services failed with connection or lookup timeouts.
+    detection: Error-rate alerts in five services within minutes of each other.
+    trigger: Black Friday peak traffic (about 9x baseline).
+    root_cause: >-
+      CoreDNS pods were CPU-throttled at peak. Because pods use ndots:5, each lookup of an external or
+      partially qualified name generated several queries, multiplying DNS load. Saturated CoreDNS
+      dropped queries and clients saw 'i/o timeout' on lookups.
+    resolution: CoreDNS scaled from 3 to 8 replicas and CPU limits removed.
+    contributing_factors:
+      - Fixed CoreDNS replica count not tied to cluster size.
+      - ndots:5 default amplifying queries.
+    timeline:
+      - "18:00 peak starts"
+      - "18:06 alerts in checkout-api, payments-api, search-api, inventory-api, order-worker"
+      - "18:20 common error 'lookup ... i/o timeout' identified"
+      - "18:55 CoreDNS scaled, recovery"
+    action_items:
+      - Run cluster-proportional-autoscaler for CoreDNS with min 6 replicas (done).
+      - Use fully-qualified names with trailing dot for hot external hosts (partly done).
+
+  - id: PM-2025-024
+    date: "2025-12-03"
+    service: catalog-api
+    severity: SEV3
+    title: Product pages slow after variant attributes release
+    duration_min: 95
+    impact: Product page p95 rose from 0.4 s to 3.8 s.
+    detection: StorefrontLatencyHigh alert.
+    trigger: Release 7.9 added queries filtering product_variant by a new color_code column.
+    root_cause: >-
+      The new column had no index, so each lookup sequentially scanned product_variant (then 35M rows).
+    resolution: Created index CONCURRENTLY on color_code.
+    contributing_factors:
+      - Migration review did not include EXPLAIN plans for new hot queries.
+    timeline:
+      - "09:00 release 7.9 deployed"
+      - "09:20 StorefrontLatencyHigh fires"
+      - "10:10 pg_stat_statements shows seq scans on product_variant"
+      - "10:35 index created, latency recovers"
+    action_items:
+      - Migration checklist - attach EXPLAIN for every hot query touching changed indexes or columns (done).
+
+  - id: PM-2026-002
+    date: "2026-01-19"
+    service: checkout-api
+    severity: SEV2
+    title: Customers lost cart contents during January sale
+    duration_min: 120
+    impact: About 6% of active carts disappeared; customers had to rebuild them.
+    detection: Customer support tickets, then CartRecreateRate dashboard.
+    trigger: Sale traffic filled cart-cache to maxmemory.
+    root_cause: >-
+      cart-cache used maxmemory-policy allkeys-lru, so at maxmemory Redis evicted active cart keys
+      along with stale data.
+    resolution: Memory raised from 2 GB to 4 GB; policy changed to volatile-lru with TTLs on all keys (CHG-2201).
+    contributing_factors:
+      - Mixed long-lived and disposable data in one Redis without TTL discipline.
+    timeline:
+      - "11:00 sale starts"
+      - "11:40 first support tickets"
+      - "12:30 evicted_keys counter found climbing"
+      - "13:00 memory increased"
+    action_items:
+      - Every key written to cart-cache must have a TTL; volatile-lru only evicts keys with TTL (done, CHG-2201).
+      - Alert when used_memory exceeds 85% of maxmemory (done).
+
+  - id: PM-2026-004
+    date: "2026-02-27"
+    service: notification-service
+    severity: SEV3
+    title: Order confirmation emails delayed during marketing campaign
+    duration_min: 160
+    impact: Confirmation emails delayed by up to 2.5 hours.
+    detection: EmailQueueBacklog alert.
+    trigger: A marketing campaign used most of the shared PostRelay limit of 100 messages/s.
+    root_cause: >-
+      PostRelay returned 429; notification-service retried immediately without backoff, so retries
+      consumed the remaining quota and kept the account throttled.
+    resolution: Campaign paused; backlog drained.
+    contributing_factors:
+      - Shared rate limit between marketing and transactional email.
+    timeline:
+      - "15:00 campaign starts"
+      - "15:20 EmailQueueBacklog fires"
+      - "16:10 logs show 429 retry loops"
+      - "17:40 backlog drained"
+    action_items:
+      - Retries with exponential backoff, jitter and Retry-After (done, CHG-2215).
+      - Request a separate PostRelay sub-account for transactional email (open).
+
+  - id: PM-2026-005
+    date: "2026-04-29"
+    service: order-worker
+    severity: SEV2
+    title: Orders stuck - order-worker in CrashLoopBackOff
+    duration_min: 75
+    impact: About 2,100 orders were delayed reaching the warehouse by up to 75 minutes.
+    detection: OrderHandoffDelay alert.
+    trigger: Spring promotion with gift messages and large multi-item orders.
+    root_cause: >-
+      Building fulfilment documents for large orders pushed peak memory to about 700 MB, over the 512Mi
+      limit; pods were OOMKilled (exit code 137) and entered CrashLoopBackOff.
+    resolution: Memory limit raised to 1Gi (CHG-2240).
+    contributing_factors:
+      - Limits sized from average usage, not peak.
+    timeline:
+      - "10:00 promotion starts"
+      - "10:12 OrderHandoffDelay fires"
+      - "10:20 kubectl describe shows Last State Terminated, Reason OOMKilled"
+      - "11:15 new limit rolled out"
+    action_items:
+      - Size memory limits from p99 peak plus 30% headroom, never from averages (done, platform handbook).
+    related_changes: [CHG-2240]
+
+  - id: PM-2026-007
+    date: "2026-06-16"
+    service: web-storefront
+    severity: SEV3
+    title: Stale prices shown after price update
+    duration_min: 210
+    impact: Product pages showed old prices for up to 3.5 hours; checkout charged the correct price.
+    detection: Customer support tickets.
+    trigger: CDN rule cached rendered product pages for 4 hours.
+    root_cause: >-
+      A CDN rule intended for static assets also matched /p/* product pages, so rendered HTML with
+      prices was cached at the edge.
+    resolution: Rule scoped to /static; cache purged.
+    timeline:
+      - "08:00 price update published"
+      - "09:30 support tickets about price mismatch"
+      - "11:10 CDN rule identified"
+      - "11:30 purge complete"
+    action_items:
+      - CDN rule changes need review by the Storefront team (done).

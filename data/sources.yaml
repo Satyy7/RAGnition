@@ -1,0 +1,55 @@
+# Public sources for the RAGnition corpus.
+# Licenses were checked on 2026-11-20 (see license_evidence). Re-check before any
+# redistribution. Raw files go to data/raw/ (gitignored); only metadata is committed.
+
+sources:
+  - id: k8s-docs
+    title: Kubernetes documentation (debugging, pods, scheduling, configuration)
+    kind: github_dir
+    doc_type: documentation
+    license: CC-BY-4.0
+    license_evidence: "LICENSE file in github.com/kubernetes/website (main), checked 2026-11-20"
+    redistributable: true
+    attribution: "Kubernetes Documentation, (c) The Kubernetes Authors, CC BY 4.0"
+    repo: kubernetes/website
+    ref: main
+    dirs:
+      - content/en/docs/tasks/debug/debug-application
+      - content/en/docs/tasks/debug/debug-cluster
+      - content/en/docs/concepts/workloads/pods
+      - content/en/docs/concepts/scheduling-eviction
+      - content/en/docs/concepts/configuration
+    max_docs: 40
+
+  - id: sre-book
+    title: "Site Reliability Engineering (Google), incident and troubleshooting chapters"
+    kind: html_pages
+    doc_type: book_chapter
+    license: CC-BY-NC-ND-4.0
+    license_evidence: "footer of sre.google/sre-book/table-of-contents/, checked 2026-11-20"
+    # NonCommercial + NoDerivatives: fine for local, non-commercial study; never
+    # commit or publish the text or anything derived from it.
+    redistributable: false
+    attribution: "Site Reliability Engineering, (c) 2017 Google, Inc., CC BY-NC-ND 4.0"
+    urls:
+      - https://sre.google/sre-book/monitoring-distributed-systems/
+      - https://sre.google/sre-book/effective-troubleshooting/
+      - https://sre.google/sre-book/emergency-response/
+      - https://sre.google/sre-book/managing-incidents/
+      - https://sre.google/sre-book/postmortem-culture/
+      - https://sre.google/sre-book/handling-overload/
+      - https://sre.google/sre-book/addressing-cascading-failures/
+      - https://sre.google/sre-book/being-on-call/
+    max_docs: 8
+
+  - id: public-postmortems
+    title: Public company postmortems linked from danluu/post-mortems
+    kind: link_index
+    doc_type: postmortem
+    # The index repo has no LICENSE file, and every linked page belongs to its
+    # own author. Treat all of it as all-rights-reserved: local use only.
+    license: all-rights-reserved (per page)
+    license_evidence: "github.com/danluu/post-mortems has no LICENSE file, checked 2026-11-20"
+    redistributable: false
+    index_url: https://raw.githubusercontent.com/danluu/post-mortems/master/README.md
+    max_docs: 80
