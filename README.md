@@ -97,3 +97,17 @@ split at headings. Three strategies are written to `data/processed/` (gitignored
 and `parent_child` (256-token children for search, 1,024-token parents for the
 LLM). Sizes are counted with the BGE tokenizer itself, and every chunk starts with
 a context header (document title and heading path). M5 compares the strategies.
+
+## Search (M4)
+
+```powershell
+uv run python scripts/build_index.py                     # embed all strategies into Qdrant
+uv run python scripts/search.py "payments timing out"     # dense and BM25 side by side
+uv run python scripts/probe_retrieval.py                 # recall@k / MRR on the eval incidents
+```
+
+Dense vectors live in Qdrant **local mode** (`data/index/qdrant`, no server or
+Docker; one process at a time). BM25 is implemented in
+`backend/ragnition/retrieval/bm25.py` with an identifier-aware tokenizer
+(`default_pool_size` is indexed whole and as `default`, `pool`, `size`) and is
+rebuilt in memory when a `Retriever` opens.

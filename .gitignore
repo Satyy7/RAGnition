@@ -17,6 +17,7 @@ data/raw/
 data/cache/
 data/models/
 data/processed/
+data/index/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
