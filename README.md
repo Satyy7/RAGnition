@@ -83,3 +83,17 @@ has to connect it. `ensure_corpus_path` refuses any file under `data/eval`, and
 
 `data/manifest.jsonl` records every document's source, license, redistribution
 flag and SHA-256.
+
+## Chunking (M3)
+
+```powershell
+uv run python scripts/chunk_corpus.py                      # parse + chunk with all strategies
+uv run python scripts/chunk_corpus.py --show PM-2025-007   # inspect one document's chunks
+```
+
+HTML is reduced to its main article with `trafilatura`; Markdown is cleaned and
+split at headings. Three strategies are written to `data/processed/` (gitignored):
+`fixed` (384 tokens, 64 overlap), `structure` (heading sections, up to 384 tokens)
+and `parent_child` (256-token children for search, 1,024-token parents for the
+LLM). Sizes are counted with the BGE tokenizer itself, and every chunk starts with
+a context header (document title and heading path). M5 compares the strategies.
