@@ -14,7 +14,7 @@ Calls:
 - none
 
 Called by:
-- none
+- every service (shared infrastructure)
 
 ## Datastores
 
@@ -28,6 +28,7 @@ Called by:
 
 - Pods use the default ndots:5, so one external or partially-qualified lookup can become up to 5 DNS queries.
 - Replica count is managed by the cluster-proportional-autoscaler (min 6).
+- The CoreDNS cache plugin keeps answers for 30 s; most service lookups are answered from cache.
 
 ## Known failure modes
 

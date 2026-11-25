@@ -38,6 +38,9 @@ class Service(BaseModel):
     slo: str
     config_notes: list[str] = []
     known_failure_modes: list[str] = []
+    # Shared infrastructure (e.g. cluster DNS) that every service uses without
+    # listing it in depends_on. The change-aware retriever treats it as adjacent to all.
+    shared: bool = False
 
 
 class Change(BaseModel):
@@ -145,6 +148,24 @@ class Label(BaseModel):
     key_facts: list[str] = []
     supporting_doc_ids: list[str] = []
     expected_fix: str | None = None
+    # The change that caused the incident, if any (M6 headline metric). Must also
+    # appear in supporting_doc_ids.
+    root_cause_change: str | None = Field(default=None, pattern=r"^CHG-\d{4}$")
+
+    def relevance(self) -> dict[str, int]:
+        """Graded relevance for nDCG: root-cause change 3, other changes and postmortems 2, the rest 1."""
+        grades = {}
+        for doc in self.supporting_doc_ids:
+            if self.root_cause_change and doc == change_doc_id(self.root_cause_change):
+                grades[doc] = 3
+            elif doc.startswith(("kestrel/change/", "kestrel/postmortem/")):
+                grades[doc] = 2
+            else:
+                grades[doc] = 1
+        return grades
+
+
+Split = Literal["dev", "test"]
 
 
 class EvalScenario(BaseModel):
@@ -155,6 +176,9 @@ class EvalScenario(BaseModel):
     reasoning: Literal["single-hop", "multi-hop", "unanswerable"]
     incident: IncidentReport
     label: Label
+    # What makes the case hard (test set): e.g. hop-1, recent-distractor, old-culprit.
+    tags: list[str] = []
+    split: Split = "dev"  # set by the loader from the file it came from
 
     @model_validator(mode="after")
     def _label_matches_answerability(self) -> EvalScenario:
@@ -162,6 +186,8 @@ class EvalScenario(BaseModel):
             raise ValueError(f"{self.id}: answerable scenarios need a root cause and supporting docs")
         if not self.answerable and (self.label.root_cause or self.label.supporting_doc_ids):
             raise ValueError(f"{self.id}: unanswerable scenarios must not carry an answer")
+        if self.label.root_cause_change and change_doc_id(self.label.root_cause_change) not in self.label.supporting_doc_ids:
+            raise ValueError(f"{self.id}: root_cause_change must be listed in supporting_doc_ids")
         return self
 
 
@@ -172,6 +198,7 @@ class EvalSet(BaseModel):
         """Every label must point at documents that really exist in the corpus."""
         known_docs = corpus_doc_ids(world)
         known_services = {s.id for s in world.services}
+        changes = {c.id: c for c in world.changes}
         ids = [s.id for s in self.scenarios]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate eval scenario ids")
@@ -180,6 +207,11 @@ class EvalSet(BaseModel):
                 raise ValueError(f"{s.id}: supporting docs not in corpus: {sorted(missing)}")
             if s.label.culprit_service and s.label.culprit_service not in known_services:
                 raise ValueError(f"{s.id}: unknown culprit service {s.label.culprit_service}")
+            if (cid := s.label.root_cause_change) and changes[cid].date > s.reported_at[:10]:
+                raise ValueError(f"{s.id}: root-cause change {cid} is dated after the incident")
+
+    def split(self, name: Split) -> list[EvalScenario]:
+        return [s for s in self.scenarios if s.split == name]
 
 
 def load_world(path: Path) -> World:
@@ -187,6 +219,17 @@ def load_world(path: Path) -> World:
         return World.model_validate(yaml.safe_load(fh))
 
 
-def load_eval_set(path: Path) -> EvalSet:
+def load_eval_set(path: Path, split: Split = "dev") -> EvalSet:
     with path.open(encoding="utf-8") as fh:
-        return EvalSet.model_validate(yaml.safe_load(fh))
+        data = yaml.safe_load(fh)
+    for s in data["scenarios"]:
+        s["split"] = split
+    return EvalSet.model_validate(data)
+
+
+def load_all_eval(dev_path: Path, test_path: Path) -> EvalSet:
+    """Dev (tuning) and held-out test incidents in one set; ids must not collide."""
+    scenarios = load_eval_set(dev_path, "dev").scenarios
+    if test_path.exists():
+        scenarios += load_eval_set(test_path, "test").scenarios
+    return EvalSet(scenarios=scenarios)

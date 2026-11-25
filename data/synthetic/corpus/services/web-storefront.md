@@ -14,6 +14,8 @@ Calls:
 - catalog-api
 - search-api
 - checkout-api
+- auth-service
+- feature-flags
 
 Called by:
 - none
@@ -30,6 +32,8 @@ Called by:
 
 - SSR upstream timeout is 3 s per backend call.
 - Static images are served from the CDN; origin is an object storage bucket.
+- Prices on product pages are fetched client-side from `/api/price/{sku}` (served by catalog-api through the storefront).
+- Sign-in, sign-out and the session cookie are handled by auth-service; card payments redirect customers to their bank for 3-D Secure and back to /checkout/return.
 
 ## Known failure modes
 

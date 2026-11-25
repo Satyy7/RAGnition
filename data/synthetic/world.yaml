@@ -22,12 +22,14 @@ services:
     team: Storefront
     language: TypeScript (Next.js, server-side rendering)
     description: Customer-facing website. Renders product, search, cart and checkout pages.
-    depends_on: [catalog-api, search-api, checkout-api]
+    depends_on: [catalog-api, search-api, checkout-api, auth-service, feature-flags]
     external: [CDN (edge cache for static assets and images)]
     slo: 99.9% of page renders under 1.5 s (p95)
     config_notes:
       - SSR upstream timeout is 3 s per backend call.
       - Static images are served from the CDN; origin is an object storage bucket.
+      - Prices on product pages are fetched client-side from `/api/price/{sku}` (served by catalog-api through the storefront).
+      - Sign-in, sign-out and the session cookie are handled by auth-service; card payments redirect customers to their bank for 3-D Secure and back to /checkout/return.
     known_failure_modes:
       - Slow upstream APIs make server-side rendering time out and return 504.
       - CDN cache rules misconfigured so prices or assets are stale.
@@ -36,12 +38,15 @@ services:
     team: Checkout
     language: Java 21 (Spring Boot)
     description: Cart and checkout orchestration. Holds carts in Redis, reserves stock, takes payment, emits orders.
-    depends_on: [inventory-api, payments-api]
+    depends_on: [inventory-api, payments-api, auth-service, shipping-api, feature-flags]
     datastores: ["cart-cache: Redis 7, maxmemory 4 GB, maxmemory-policy volatile-lru"]
     slo: 99.95% successful checkout requests; p95 latency under 800 ms
     config_notes:
       - Carts are Redis keys `cart:{session}`; the platform rule is that every key carries a TTL (carts 7 days).
       - Calls inventory-api `GET /v2/availability` before reserving stock and maps the JSON response to a strict DTO (unknown or missing required fields fail deserialization).
+      - Customer requests carry a JWT issued by auth-service; checkout-api verifies it against the auth-service JWKS, which it caches for 24 h.
+      - Delivery options and prices come from shipping-api `GET /v1/quotes` (timeout 3 s).
+      - Payment calls to payments-api run on a bounded pool of 50 worker threads with a 20 s timeout.
     known_failure_modes:
       - Redis memory pressure; behaviour depends on the eviction policy and on keys having TTLs.
       - Downstream schema changes break response parsing.
@@ -60,6 +65,8 @@ services:
       - PgBouncer `default_pool_size` is the number of real server connections per database/user pair.
       - The Paygate trust bundle is a ConfigMap `paygate-ca-bundle` updated by hand.
       - The Paygate client certificate is issued and renewed by cert-manager (since PM-2025-015).
+      - Paygate only accepts client certificates issued by 'Kestrel Partner CA', the CA registered with Paygate during onboarding.
+      - Paygate HTTP client - request timeout 2 s; keep-alive connections are reused and TLS sessions are resumed, so most requests skip the full mutual-TLS handshake (about 300 ms).
     known_failure_modes:
       - Connection waits at PgBouncer when client demand exceeds the server pool.
       - TLS failures towards Paygate (expired client certificate, untrusted server chain).
@@ -75,7 +82,9 @@ services:
     config_notes:
       - Reservation consumer settings max.poll.records=500, max.poll.interval.ms=300000 (5 minutes).
       - If one poll batch takes longer than max.poll.interval.ms, the consumer is removed from the group and partitions are rebalanced.
-      - Public API `/v2/availability` is consumed by checkout-api.
+      - Public API `/v2/availability` is consumed by checkout-api. For bundle products it resolves the bundle's components through catalog-api `GET /v1/bundles/{id}`.
+      - inventory-db allows max_connections=150; each inventory-api replica opens up to 10 connections (HPA 3 to 8 replicas).
+      - The reservations table receives about 4 million updates per day; it relies on autovacuum to stay compact.
     known_failure_modes:
       - Slow per-message processing causes rebalance loops and growing consumer lag.
       - Breaking API changes affect checkout-api.
@@ -90,6 +99,8 @@ services:
     config_notes:
       - Variant lookups by SKU (`WHERE sku = $1`) are the hottest query (cart and checkout pages).
       - Schema migrations are Flyway scripts applied on deploy.
+      - An in-process product cache (`catalog.cache.enabled`) serves about 85% of product, price and bundle reads.
+      - Publishes product change events to the Kafka topic `catalog.product-updated`, consumed by the search-indexer.
     known_failure_modes:
       - Missing or unusable indexes cause sequential scans on product_variant.
       - Long migrations lock tables.
@@ -98,13 +109,15 @@ services:
     team: Search
     language: Java 21
     description: Product search and the search-indexer job that writes catalog updates into OpenSearch.
-    depends_on: [catalog-api]
+    depends_on: [catalog-api, feature-flags]
     datastores: ["OpenSearch cluster search-prod: 3 data nodes, 500 GB disk each; indices products-*, search-querylog-*"]
     slo: search p95 under 300 ms; catalog changes searchable within 5 minutes
     config_notes:
       - OpenSearch disk watermarks are defaults (low 85%, high 90%, flood_stage 95%).
       - At flood_stage OpenSearch puts index.blocks.read_only_allow_delete on indices with a shard on that node.
       - The query log indices search-querylog-* are managed by an index lifecycle policy (retention setting).
+      - The search-indexer reads catalog change events from the Kafka topic `catalog.product-updated`.
+      - Text queries match the title field with fuzziness AUTO and other fields exactly; search-prod is sized for this at about 35% CPU at peak.
     known_failure_modes:
       - Disk watermarks reached, so shards stay unassigned (high) or indices are write-blocked (flood stage).
       - Indexer backlog makes search results stale.
@@ -113,10 +126,11 @@ services:
     team: Fulfilment
     language: Python 3.12
     description: Consumes the orders topic, builds fulfilment documents and pushes them to the warehouse system.
-    depends_on: [inventory-api, notification-service]
+    depends_on: [inventory-api, notification-service, shipping-api, feature-flags]
     datastores: ["Kafka topic orders"]
     slo: orders handed to warehouse within 10 minutes
     config_notes:
+      - Requests a shipping label from shipping-api `POST /v1/labels` for each order and copies `tracking_number` from the response into the warehouse hand-off (required field).
       - Kubernetes resources in Helm values `order-worker.resources` (requests and limits).
       - Peak resident memory measured at about 700 MB during sale traffic (PM-2026-005).
     known_failure_modes:
@@ -132,6 +146,7 @@ services:
     config_notes:
       - Marketing campaigns share the same PostRelay account and limit.
       - Retry policy must honour Retry-After and use exponential backoff with jitter (PM-2026-004).
+      - PostRelay rejects mail from a sender domain without published SPF and DKIM records (permanent error 550 5.7.26).
     known_failure_modes:
       - Provider throttling (429) and retry amplification build a send backlog.
 
@@ -140,12 +155,60 @@ services:
     language: CoreDNS 1.11 (Kubernetes add-on)
     description: In-cluster DNS for service discovery in prod-eu1.
     depends_on: []
+    shared: true
     slo: lookup p99 under 50 ms
     config_notes:
       - Pods use the default ndots:5, so one external or partially-qualified lookup can become up to 5 DNS queries.
       - Replica count is managed by the cluster-proportional-autoscaler (min 6).
+      - The CoreDNS cache plugin keeps answers for 30 s; most service lookups are answered from cache.
     known_failure_modes:
       - CoreDNS CPU saturation causes lookup timeouts in every service at once.
+
+  - id: auth-service
+    team: Identity
+    language: Go 1.23
+    description: Customer sign-in, sessions and token issuing for the storefront and checkout.
+    depends_on: []
+    datastores: ["session-store: Redis 7, maxmemory 2 GB, maxmemory-policy noeviction"]
+    slo: 99.95% successful sign-ins; token verification keys always available
+    config_notes:
+      - Issues JWTs signed with a rotating signing key; public keys are published at `/.well-known/jwks.json`.
+      - Consumers (checkout-api, web-storefront) cache the JWKS for 24 h, so a retired key must stay published for at least 24 h after rotation.
+      - Sessions are Redis keys `sess:{id}` with a 1-day TTL; about 40 MB of new session data is written per day.
+      - The session cookie is SameSite=Lax so that it is sent when customers return from their bank's 3-D Secure page.
+    known_failure_modes:
+      - Signing key rotated without overlap, so tokens fail verification with 401 in consumers.
+      - session-store full; with noeviction Redis rejects writes and sign-ins fail.
+
+  - id: shipping-api
+    team: Fulfilment
+    language: Python 3.12 (FastAPI)
+    description: Delivery quotes for checkout and shipping labels for order-worker, through the CarrierHub API.
+    depends_on: []
+    external: ["CarrierHub carrier API: account limit 50 requests/s shared by quotes and labels; returns HTTP 429 when exceeded"]
+    slo: quotes p95 under 400 ms; labels within 2 minutes of request
+    config_notes:
+      - Carrier rates are cached for 15 minutes per (origin, destination, weight band); about 92% of quote requests hit the cache.
+      - Labels are created with `POST /v1/labels`; the response contains tracking_number, carrier and label_url.
+    known_failure_modes:
+      - CarrierHub rate limit exceeded, so labels and quotes fail with upstream 429.
+      - Slow CarrierHub responses make checkout quotes time out.
+
+  - id: feature-flags
+    team: Platform
+    language: Go 1.23
+    description: In-house feature flag service. Services read flags through the flag client SDK.
+    depends_on: []
+    datastores: ["flags-db: PostgreSQL 15 (small)"]
+    slo: flag fetch p99 under 100 ms
+    config_notes:
+      - SDK clients poll `/api/client/features` every 30 s and keep the last good values in memory.
+      - If a client cannot fetch flags at startup it falls back to the defaults compiled into each service; several defaults are outdated.
+      - Sized for about 400 polling clients at a 30 s interval (2 replicas).
+      - Clients in web-storefront, checkout-api, search-api and order-worker.
+    known_failure_modes:
+      - Flag service unreachable, so services start with compiled defaults and features change unexpectedly.
+      - Polling load overloads the service and flag fetches time out.
 
 # ------------------------------------------------------------------ change log
 changes:
@@ -215,6 +278,170 @@ changes:
   - {id: CHG-2344, date: "2026-11-13", service: catalog-api, kind: deploy, team: Catalog,
      summary: "catalog-api v8.5: Kotlin 2.1 upgrade",
      details: "Compiler and runtime upgrade; no API changes."}
+
+  # ---- 2026-10-30 to 2027-01-25 (M6). Neutral wording: what changed, never what it caused.
+  - {id: CHG-2314, date: "2026-10-30", service: auth-service, kind: deploy, team: Identity,
+     summary: "auth-service v4.2: 'remember me' sessions kept until sign-out",
+     details: "Sessions created with remember_me=true are now stored in session-store without an expiry and deleted on sign-out. Other sessions keep the 1-day TTL. Requested by Storefront to reduce repeat sign-ins."}
+  - {id: CHG-2350, date: "2026-11-30", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.9.0: cart-cleaner enabled",
+     details: "Flag cart-cleaner switched on; carts idle for 7 days are deleted by the background job, and new carts are written with a 7-day TTL."}
+  - {id: CHG-2351, date: "2026-12-01", service: auth-service, kind: config, team: Identity,
+     summary: "Daily rotation of the token signing key",
+     details: "Signing key now rotates every day at 06:00 UTC (was quarterly, manual). At each rotation the JWKS endpoint publishes only the new key. Security review item SEC-219."}
+  - {id: CHG-2361, date: "2026-12-01", service: order-worker, kind: config, team: Fulfilment,
+     summary: "order-worker memory limit set back to 1Gi",
+     details: "Helm values order-worker.resources: memory limit 1Gi, memory request 768Mi. Reverses the October right-sizing."}
+  - {id: CHG-2352, date: "2026-12-02", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.9.1: address autocomplete",
+     details: "Adds address autocomplete to the shipping step through a new frontend-facing endpoint. No change to token handling, stock or payment calls."}
+  - {id: CHG-2353, date: "2026-12-03", service: shipping-api, kind: config, team: Fulfilment,
+     summary: "Label pre-generation job enabled",
+     details: "New cron job label-prefetch requests carrier labels for every order awaiting pick-up, every 10 minutes, so labels are ready before the warehouse needs them. Uses the existing CarrierHub account. About 9,000 open orders per run during December."}
+  - {id: CHG-2354, date: "2026-12-03", service: payments-api, kind: config, team: Platform,
+     summary: "PgBouncer default_pool_size for payments-db set to 60",
+     details: "The nightly reconciliation job now has its own pool (reconcile, 10 connections); payments pool size restored to 60 server connections. Applied via platform-config PR #4188."}
+  - {id: CHG-2355, date: "2026-12-04", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.6: product events v2",
+     details: "Product change events are published to the new topic catalog.product-updated.v2 with schema v2 (adds variant-level fields). Publishing to the old topic catalog.product-updated stops with this release."}
+  - {id: CHG-2356, date: "2026-12-05", service: search-api, kind: config, team: Search,
+     summary: "Synonym dictionary refresh (kitchenware)",
+     details: "Adds 300 synonyms for kitchenware. Query-time only; no reindex."}
+  - {id: CHG-2357, date: "2026-12-07", service: feature-flags, kind: deploy, team: Platform,
+     summary: "feature-flags v2.0: new evaluation API",
+     details: "Flags are now served from /api/v2/flags. The /api/client/features endpoint is removed in this release. Flag client SDK 3.0, which uses the new endpoint, was published the same day."}
+  - {id: CHG-2358, date: "2026-12-07", service: web-storefront, kind: deploy, team: Storefront,
+     summary: "web-storefront v14.6: winter theme",
+     details: "Visual changes only."}
+  - {id: CHG-2359, date: "2026-12-09", service: payments-api, kind: config, team: Payments,
+     summary: "Paygate HTTP client hardening (SEC-212)",
+     details: "Security review SEC-212: TLS session tickets disabled on the Paygate client and keep-alive idle timeout lowered from 90 s to 5 s."}
+  - {id: CHG-2360, date: "2026-12-09", service: payments-api, kind: deploy, team: Payments,
+     summary: "payments-api v7.3: logging library update",
+     details: "Structured logging library patch release. No functional changes."}
+  - {id: CHG-2362, date: "2026-12-09", service: inventory-api, kind: config, team: Fulfilment,
+     summary: "Reservation consumer max.poll.records raised from 500 to 2000",
+     details: "To drain the holiday reservation backlog with fewer round trips. max.poll.interval.ms unchanged."}
+  - {id: CHG-2363, date: "2026-12-10", service: inventory-api, kind: deploy, team: Fulfilment,
+     summary: "inventory-api v3.14: readiness endpoint",
+     details: "Adds /ready for Kubernetes readiness probes. No change to the reservation consumer."}
+  - {id: CHG-2364, date: "2026-12-12", service: inventory-api, kind: config, team: Fulfilment,
+     summary: "autovacuum disabled on reservations table during stock import",
+     details: "ALTER TABLE reservations SET (autovacuum_enabled = false) to speed up the December bulk stock import. To be re-enabled after the import (ticket FUL-401)."}
+  - {id: CHG-2365, date: "2026-12-13", service: catalog-api, kind: config, team: Catalog,
+     summary: "In-process product cache switched off",
+     details: "catalog.cache.enabled=false while stale price reports are investigated (CAT-552). All product, price and bundle reads now go to catalog-db."}
+  - {id: CHG-2366, date: "2026-12-14", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.9.3: gift wrap option",
+     details: "Adds a gift wrap line item. No change to stock, shipping or payment calls."}
+  - {id: CHG-2368, date: "2026-12-15", service: cluster-dns, kind: config, team: Platform,
+     summary: "CoreDNS cache TTL lowered from 30 s to 5 s",
+     details: "So that endpoint changes during blue-green deploys propagate faster. Replica count unchanged."}
+  - {id: CHG-2369, date: "2026-12-15", service: search-api, kind: deploy, team: Search,
+     summary: "search-api v6.5: result highlighting",
+     details: "Highlights matched terms in result titles."}
+  - {id: CHG-2370, date: "2026-12-15", service: order-worker, kind: deploy, team: Fulfilment,
+     summary: "order-worker v4.8: carrier selection rules",
+     details: "Chooses the carrier by parcel size and destination. Same calls to shipping-api."}
+  - {id: CHG-2372, date: "2026-12-16", service: notification-service, kind: deploy, team: Customer Comms,
+     summary: "notification-service v2.5: new order confirmation template",
+     details: "HTML template refresh. Sending and retry logic unchanged."}
+  - {id: CHG-2374, date: "2026-12-17", service: order-worker, kind: deploy, team: Fulfilment,
+     summary: "order-worker v4.9: packing slips rendered in-process",
+     details: "Packing slip PDFs are now rendered inside order-worker with the pdfkit library instead of the document-render service. Product images are embedded at full resolution."}
+  - {id: CHG-2378, date: "2026-12-18", service: auth-service, kind: deploy, team: Identity,
+     summary: "auth-service v4.3: password reset email copy",
+     details: "Text changes in the password reset email. No functional changes."}
+  - {id: CHG-2376, date: "2026-12-19", service: web-storefront, kind: config, team: Storefront,
+     summary: "CDN: cache /api/price/* at the edge",
+     details: "New CDN rule caches /api/price/* responses for 1 hour to reduce origin load during the holiday sale."}
+  - {id: CHG-2377, date: "2026-12-19", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.7: price rounding fix",
+     details: "Prices with three decimal places are rounded half-even. Affects about 40 SKUs."}
+  - {id: CHG-2380, date: "2026-12-26", service: payments-api, kind: config, team: Payments,
+     summary: "payments-api scaled from 6 to 10 replicas for the holiday peak",
+     details: "HPA minimum 10. Per-replica database pool unchanged (max 20)."}
+  - {id: CHG-2381, date: "2026-12-27", service: payments-api, kind: deploy, team: Payments,
+     summary: "payments-api v7.4: 3-D Secure challenge copy",
+     details: "Text changes in the 3-D Secure challenge flow."}
+  - {id: CHG-2383, date: "2026-12-29", service: checkout-api, kind: config, team: Checkout,
+     summary: "cart-cache maxmemory-policy set to allkeys-lru",
+     details: "Changed after write errors on cart-cache at 98% memory during the holiday sale, so that Redis can always free memory."}
+  - {id: CHG-2384, date: "2026-12-30", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.9.4: express checkout button",
+     details: "Adds an express checkout button on the cart page."}
+  - {id: CHG-2386, date: "2027-01-03", service: catalog-api, kind: migration, team: Catalog,
+     summary: "Flyway V93: add product_variant.weight_grams",
+     details: "ALTER TABLE product_variant ADD COLUMN weight_grams integer, then a single UPDATE backfills it from the legacy dimensions table for every row, in the same transaction. Applied on deploy at 10:00 UTC."}
+  - {id: CHG-2387, date: "2027-01-03", service: web-storefront, kind: deploy, team: Storefront,
+     summary: "web-storefront v14.8: search suggestions UI",
+     details: "New dropdown for search suggestions. Uses the existing search-api endpoint."}
+  - {id: CHG-2390, date: "2027-01-04", service: order-worker, kind: config, team: Fulfilment,
+     summary: "order-worker consumer concurrency raised from 4 to 6",
+     details: "More parallel order processing per pod."}
+  - {id: CHG-2389, date: "2027-01-05", service: shipping-api, kind: deploy, team: Fulfilment,
+     summary: "shipping-api v2.4: label response cleanup",
+     details: "In POST /v1/labels responses the field tracking_number is renamed tracking_id, matching CarrierHub naming. API reference updated."}
+  - {id: CHG-2392, date: "2027-01-06", service: search-api, kind: config, team: Search,
+     summary: "Fuzzy matching on all text fields",
+     details: "Query builder applies fuzziness AUTO to every text field (description, brand, attributes), not only the title, to find more results for misspelled queries."}
+  - {id: CHG-2393, date: "2027-01-06", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.8: dependency updates",
+     details: "Ktor and driver patch releases. No functional changes."}
+  - {id: CHG-2395, date: "2027-01-08", service: feature-flags, kind: config, team: Platform,
+     summary: "Flag polling interval lowered from 30 s to 1 s",
+     details: "Allows near-instant kill switches. The interval is advertised by the server, so it applies to every SDK client without a redeploy. Replica count unchanged."}
+  - {id: CHG-2397, date: "2027-01-08", service: search-api, kind: deploy, team: Search,
+     summary: "search-api v6.6: autocomplete ranking",
+     details: "Ranks autocomplete suggestions by recent popularity."}
+  - {id: CHG-2396, date: "2027-01-09", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.10: saved cards UI",
+     details: "Shows saved cards on the payment step. Card data stays with Paygate."}
+  - {id: CHG-2399, date: "2027-01-10", service: payments-api, kind: infra, team: Platform,
+     summary: "paygate-client certificate moved to ClusterIssuer internal-ca-v2",
+     details: "Platform CA consolidation PLAT-90: cert-manager Certificate paygate-client now uses ClusterIssuer internal-ca-v2. The certificate was re-issued on 2027-01-10 at 22:00 UTC."}
+  - {id: CHG-2401, date: "2027-01-12", service: inventory-api, kind: config, team: Fulfilment,
+     summary: "inventory-api HPA maximum raised from 8 to 24 replicas",
+     details: "For the January sale. Per-replica database pool unchanged."}
+  - {id: CHG-2403, date: "2027-01-14", service: auth-service, kind: config, team: Identity,
+     summary: "Session cookie SameSite changed from Lax to Strict",
+     details: "Security hardening item SEC-230. Applies to the session cookie on all storefront pages."}
+  - {id: CHG-2404, date: "2027-01-15", service: web-storefront, kind: deploy, team: Storefront,
+     summary: "web-storefront v14.9: footer links",
+     details: "Footer navigation update."}
+  - {id: CHG-2406, date: "2027-01-16", service: shipping-api, kind: config, team: Fulfilment,
+     summary: "Carrier rate cache switched off",
+     details: "Rates are fetched from CarrierHub for every quote request so customers never see outdated delivery prices (SHIP-77)."}
+  - {id: CHG-2407, date: "2027-01-16", service: checkout-api, kind: deploy, team: Checkout,
+     summary: "checkout-api v5.10.1: promo code validation",
+     details: "Validates promo codes before the payment step."}
+  - {id: CHG-2409, date: "2027-01-18", service: notification-service, kind: deploy, team: Customer Comms, status: rolled-back,
+     summary: "notification-service v2.6: template engine upgrade",
+     details: "Rolled back the same day after rendering differences in test emails."}
+  - {id: CHG-2410, date: "2027-01-18", service: notification-service, kind: config, team: Customer Comms,
+     summary: "Sender address moved to mail.kestrel.example",
+     details: "From address changes from orders@kestrel.example to orders@mail.kestrel.example to separate transactional mail. DNS records for the new domain requested in ticket NET-118."}
+  - {id: CHG-2411, date: "2027-01-19", service: web-storefront, kind: config, team: Storefront,
+     summary: "Image CDN quality setting lowered from 80 to 75",
+     details: "Smaller product images; no URL changes."}
+  - {id: CHG-2413, date: "2027-01-20", service: catalog-api, kind: deploy, team: Catalog,
+     summary: "catalog-api v8.9: variant attributes in product response",
+     details: "GET /v1/products/{id} now includes the attributes of every variant. Attributes are loaded with one query per variant from variant_attribute."}
+  - {id: CHG-2414, date: "2027-01-22", service: catalog-api, kind: migration, team: Catalog,
+     summary: "Flyway V95: index on variant_attribute(variant_id)",
+     details: "Creates idx_variant_attribute_variant CONCURRENTLY."}
+  - {id: CHG-2417, date: "2027-01-22", service: payments-api, kind: config, team: Payments,
+     summary: "Paygate request timeout raised from 2 s to 15 s",
+     details: "To decline fewer payments when Paygate is slow."}
+  - {id: CHG-2418, date: "2027-01-24", service: inventory-api, kind: deploy, team: Fulfilment,
+     summary: "inventory-api v3.16: log format update",
+     details: "JSON log fields renamed for the new log pipeline."}
+  - {id: CHG-2419, date: "2027-01-25", service: inventory-api, kind: config, team: Fulfilment,
+     summary: "Reservation consumer uses static group membership",
+     details: "group.instance.id set per pod so that restarts do not trigger a rebalance."}
+  - {id: CHG-2420, date: "2027-01-27", service: web-storefront, kind: deploy, team: Storefront,
+     summary: "web-storefront v15.0: account page redesign",
+     details: "New account overview page."}
 
 # ------------------------------------------------------------- past incidents
 history:
@@ -462,3 +689,77 @@ history:
       - "11:30 purge complete"
     action_items:
       - CDN rule changes need review by the Storefront team (done).
+
+  - id: PM-2026-009
+    date: "2026-08-12"
+    service: auth-service
+    severity: SEV2
+    title: Signed-in customers rejected at checkout after key rotation
+    duration_min: 95
+    impact: About 30% of signed-in checkout requests failed with 401 for 95 minutes.
+    detection: CheckoutAuthFailures alert; customer support tickets about being asked to sign in again.
+    trigger: Quarterly manual rotation of the auth-service token signing key.
+    root_cause: >-
+      The rotation script removed the previous public key from the JWKS endpoint immediately. Consumers
+      had the old key set cached for up to 24 hours, so tokens signed with the new key failed
+      verification ('kid not found') until each consumer's cache expired.
+    resolution: Old and new keys both published again; consumer caches flushed by restarting pods.
+    contributing_factors:
+      - JWKS cache duration in consumers was not documented in auth-service.
+    timeline:
+      - "06:00 rotation script runs"
+      - "06:07 CheckoutAuthFailures fires"
+      - "06:50 logs show 'kid not found in JWKS' in checkout-api"
+      - "07:35 both keys published, checkout-api restarted, recovery"
+    action_items:
+      - Keep the previous key published for at least the longest consumer JWKS cache time (24 h) after a rotation (done, in rotation runbook).
+      - Consumers refetch the JWKS when they see an unknown kid (open, CHK-410).
+
+  - id: PM-2026-010
+    date: "2026-09-03"
+    service: shipping-api
+    severity: SEV2
+    title: Shipping labels failing during back-to-school sale
+    duration_min: 70
+    impact: About 4,000 orders waited up to 70 minutes for a shipping label; checkout delivery quotes were slow.
+    detection: LabelFailureRate alert.
+    trigger: order-worker scaled out for the sale and requested labels in parallel.
+    root_cause: >-
+      Label and quote requests together exceeded the shared CarrierHub limit of 50 requests/s.
+      CarrierHub answered 429 and shipping-api passed the failures back as 503 to order-worker.
+    resolution: order-worker concurrency reduced; label backlog drained.
+    contributing_factors:
+      - No client-side rate limit in shipping-api for the CarrierHub account.
+      - Quotes and labels share one account limit.
+    timeline:
+      - "09:00 sale starts, order-worker scales out"
+      - "09:14 LabelFailureRate fires"
+      - "09:40 shipping-api logs show CarrierHub 429"
+      - "10:10 concurrency reduced, recovery"
+    action_items:
+      - Any new CarrierHub traffic needs a capacity check against the 50 requests/s account limit (done, review checklist).
+      - Client-side rate limiter in shipping-api (open, SHIP-52).
+
+  - id: PM-2026-011
+    date: "2026-10-07"
+    service: feature-flags
+    severity: SEV3
+    title: Storefront features reverted to defaults during flag service outage
+    duration_min: 40
+    impact: Pods that restarted during the outage ran with compiled default flags; the old checkout page and legacy search ranking were served to some customers.
+    detection: Customer reports and a drop in search click-through.
+    trigger: flags-db failover made feature-flags unavailable for 40 minutes.
+    root_cause: >-
+      Clients that started while the flag service was unreachable fell back to defaults compiled into
+      each service, and several of those defaults were outdated.
+    resolution: flags-db failover completed; affected pods restarted to load current flags.
+    contributing_factors:
+      - Compiled defaults not kept in sync with production flag values.
+    timeline:
+      - "14:02 flags-db failover starts"
+      - "14:10 first reports of old checkout page"
+      - "14:30 logs show 'flag fetch failed, using defaults'"
+      - "14:42 flag service back, pods restarted"
+    action_items:
+      - Alert when flag fetches fail in any client (done).
+      - Keep compiled defaults in sync with production values (open, PLAT-77).

@@ -44,6 +44,7 @@ scenarios:
         - sv_active is pinned at 25 with clients waiting, so the server pool is the bottleneck.
         - Same mechanism as PM-2025-007 (client demand above the PgBouncer pool).
       supporting_doc_ids: [kestrel/change/CHG-2318, kestrel/postmortem/PM-2025-007, kestrel/service/payments-api]
+      root_cause_change: CHG-2318
       expected_fix: Restore default_pool_size to 60 (or move the reconciliation job to a separate pool) and recheck the capacity rule.
 
   - id: EVAL-002
@@ -74,6 +75,7 @@ scenarios:
         - volatile-lru evicts only keys with an expiry (CHG-2201, PM-2026-002); evicted_keys=0 and almost no keys have expires.
         - Redis returns "OOM command not allowed" when it cannot evict at maxmemory.
       supporting_doc_ids: [kestrel/change/CHG-2331, kestrel/change/CHG-2201, kestrel/postmortem/PM-2026-002, kestrel/service/checkout-api]
+      root_cause_change: CHG-2331
       expected_fix: Roll back to v5.7.2 or set TTLs on cart keys; then expire or delete the TTL-less keys.
 
   - id: EVAL-003
@@ -104,6 +106,7 @@ scenarios:
         - 500 records x ~0.8 s is about 400 s, above max.poll.interval.ms 300000.
         - Same mechanism as PM-2025-019; its action item to reduce max.poll.records (FUL-312) is still open.
       supporting_doc_ids: [kestrel/change/CHG-2325, kestrel/postmortem/PM-2025-019, kestrel/service/inventory-api]
+      root_cause_change: CHG-2325
       expected_fix: Roll back the enrichment or lower max.poll.records (e.g. 50) and batch/cache the catalog lookups.
 
   - id: EVAL-004
@@ -133,6 +136,7 @@ scenarios:
         - Flood stage (95%) applies index.blocks.read_only_allow_delete.
         - Related disk-watermark history in PM-2025-011.
       supporting_doc_ids: [kestrel/change/CHG-2309, kestrel/service/search-api, kestrel/postmortem/PM-2025-011]
+      root_cause_change: CHG-2309
       expected_fix: Delete or shrink old query log indices, revert retention, then remove the read-only block once disk is below the watermark.
 
   - id: EVAL-005
@@ -159,6 +163,7 @@ scenarios:
         - CHG-2340 set memory limit 512Mi (was 1Gi) from October averages.
         - Peak RSS is about 700 MB (PM-2026-005); the handbook says size from peak plus headroom.
       supporting_doc_ids: [kestrel/change/CHG-2340, kestrel/postmortem/PM-2026-005, kestrel/service/order-worker]
+      root_cause_change: CHG-2340
       expected_fix: Restore the 1Gi limit and size limits from p99 peak plus 30%.
 
   - id: EVAL-006
@@ -185,6 +190,7 @@ scenarios:
         - payments-api verifies Paygate against the hand-maintained ConfigMap paygate-ca-bundle.
         - The error is about the server chain (unknown authority), not the client certificate (renewed by cert-manager).
       supporting_doc_ids: [kestrel/change/CHG-2302, kestrel/service/payments-api]
+      root_cause_change: CHG-2302
       expected_fix: Add Paygate Issuing CA G3 to paygate-ca-bundle and restart or reload payments-api.
 
   - id: EVAL-007
@@ -215,6 +221,7 @@ scenarios:
         - CHG-2336 reduced CoreDNS to 2 replicas and disabled the autoscaler (min was 6).
         - Same mechanism as PM-2025-022; ndots:5 amplifies query volume.
       supporting_doc_ids: [kestrel/change/CHG-2336, kestrel/postmortem/PM-2025-022, kestrel/service/cluster-dns]
+      root_cause_change: CHG-2336
       expected_fix: Re-enable the proportional autoscaler (min 6) and scale CoreDNS now.
 
   - id: EVAL-008
@@ -242,6 +249,7 @@ scenarios:
         - Lookups by sku are the hottest query; the plan shows a Seq Scan.
         - PM-2025-024 required EXPLAIN plans for hot queries in migration review.
       supporting_doc_ids: [kestrel/change/CHG-2321, kestrel/service/catalog-api, kestrel/postmortem/PM-2025-024]
+      root_cause_change: CHG-2321
       expected_fix: Create an index on sku CONCURRENTLY (or restore idx_variant_sku).
 
   - id: EVAL-009
@@ -271,6 +279,7 @@ scenarios:
         - CHG-2215 had added backoff with jitter and Retry-After after PM-2026-004; v2.4 undid it.
         - The campaign shares the 100 messages/s PostRelay limit.
       supporting_doc_ids: [kestrel/change/CHG-2328, kestrel/change/CHG-2215, kestrel/postmortem/PM-2026-004]
+      root_cause_change: CHG-2328
       expected_fix: Configure the http-client to back off with jitter and honour Retry-After (or roll back to v2.3); pause the campaign to drain.
 
   - id: EVAL-010
@@ -298,6 +307,7 @@ scenarios:
         - CHG-2333 removed available_qty in favour of quantity_available.
         - checkout-api maps the response to a strict DTO (service notes).
       supporting_doc_ids: [kestrel/change/CHG-2333, kestrel/service/checkout-api, kestrel/service/inventory-api]
+      root_cause_change: CHG-2333
       expected_fix: Roll back inventory-api v3.13 (or restore the field), then move checkout-api to quantity_available.
 
   - id: EVAL-011

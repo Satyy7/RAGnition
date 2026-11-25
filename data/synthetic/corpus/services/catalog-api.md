@@ -30,6 +30,8 @@ Called by:
 
 - Variant lookups by SKU (`WHERE sku = $1`) are the hottest query (cart and checkout pages).
 - Schema migrations are Flyway scripts applied on deploy.
+- An in-process product cache (`catalog.cache.enabled`) serves about 85% of product, price and bundle reads.
+- Publishes product change events to the Kafka topic `catalog.product-updated`, consumed by the search-indexer.
 
 ## Known failure modes
 

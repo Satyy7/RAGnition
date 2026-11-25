@@ -13,6 +13,8 @@ Consumes the orders topic, builds fulfilment documents and pushes them to the wa
 Calls:
 - inventory-api
 - notification-service
+- shipping-api
+- feature-flags
 
 Called by:
 - none
@@ -27,6 +29,7 @@ Called by:
 
 ## Configuration notes
 
+- Requests a shipping label from shipping-api `POST /v1/labels` for each order and copies `tracking_number` from the response into the warehouse hand-off (required field).
 - Kubernetes resources in Helm values `order-worker.resources` (requests and limits).
 - Peak resident memory measured at about 700 MB during sale traffic (PM-2026-005).
 

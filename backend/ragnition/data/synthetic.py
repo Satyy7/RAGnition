@@ -57,6 +57,8 @@ def _bullets(items: Iterable[str]) -> str:
 
 def render_service(world: World, svc: Service) -> str:
     used_by = [s.id for s in world.services if svc.id in s.depends_on]
+    if svc.shared:
+        used_by = ["every service (shared infrastructure)"]
     return (
         f"{BANNER}# Service: {svc.id}\n\n"
         f"**Team:** {svc.team}  \n**Runtime:** {svc.language}  \n**SLO:** {svc.slo}\n\n"
@@ -208,8 +210,8 @@ def write_eval_files(evalset: EvalSet, incidents_dir: Path = EVAL_INCIDENTS_DIR,
     lines = []
     for s in evalset.scenarios:
         (incidents_dir / f"{s.id}.md").write_text(render_incident(s), encoding="utf-8")
-        lines.append(json.dumps({"id": s.id, "answerable": s.answerable, "reasoning": s.reasoning,
-                                 **s.label.model_dump()}, ensure_ascii=False))
+        lines.append(json.dumps({"id": s.id, "split": s.split, "answerable": s.answerable, "reasoning": s.reasoning,
+                                 "tags": s.tags, **s.label.model_dump()}, ensure_ascii=False))
     labels_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return len(lines)
 

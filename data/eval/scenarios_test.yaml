@@ -1,0 +1,879 @@
+# SYNTHETIC HELD-OUT TEST SET (M6). NEVER INGEST THIS FILE. NEVER TUNE ON IT.
+#
+# Written and frozen (scenarios_test.lock + its own git commit) BEFORE any M6
+# scoring code existed. The M6 scorer is tuned on data/eval/scenarios.yaml (dev)
+# only; this file is scored ONCE, and the report records its SHA-256.
+#
+# Cases are adversarial on purpose. Tags say what makes each one hard:
+#   hop-0 / hop-1 / hop-2   graph distance from the service named in the symptoms to the culprit
+#   shared-infra            culprit is infrastructure used by many services
+#   culprit-unnamed         the culprit service never appears in the incident text
+#   recent-distractor       a change closer in time, on the same or a nearby service, is not the cause
+#   lexical-distractor      a change whose words match the symptoms is not the cause
+#   after-distractor        a related change dated AFTER the incident (must not be blamed)
+#   rolled-back-distractor  a rolled-back change on the same service
+#   old-culprit             culprit is older than 14 days (a time-window heuristic misses it)
+#   no-change               no change caused it; blaming a change is wrong
+
+scenarios:
+  - id: EVAL-101
+    title: Signed-in customers rejected at checkout
+    reported_at: "2026-12-02T08:10:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Since about 06:00 signed-in customers get "please sign in again" when they place an order.
+        Guest checkout works. Checkout shipped v5.9.1 this morning.
+      alerts:
+        - "CheckoutAuthFailures: checkout-api 401 ratio 28%"
+      logs:
+        - '2026-12-02T06:04:12Z checkout-api WARN JwtVerifier - token rejected: kid "k-20261202" not found in JWKS'
+        - '2026-12-02T06:04:12Z checkout-api DEBUG JwksCache - keys=[k-20261201] fetched_at=2026-12-01T09:12:40Z max_age=86400'
+    label:
+      culprit_service: auth-service
+      category: config change / key rotation
+      root_cause: >-
+        The new daily signing-key rotation (CHG-2351) drops the old public key from the JWKS at the
+        moment of rotation, while checkout-api keeps its JWKS for 24 hours; tokens signed with the
+        new key carry a kid that checkout-api does not know, so it answers 401.
+      key_facts:
+        - CHG-2351 rotates the key daily at 06:00 UTC and publishes only the new key.
+        - checkout-api caches the JWKS for 24 h; the log shows only yesterday's key in cache.
+        - Same mechanism as PM-2026-009, whose action item required keeping the old key for 24 h.
+        - checkout-api v5.9.1 (CHG-2352) does not touch token handling.
+      supporting_doc_ids: [kestrel/change/CHG-2351, kestrel/postmortem/PM-2026-009, kestrel/service/auth-service, kestrel/service/checkout-api]
+      root_cause_change: CHG-2351
+      expected_fix: Publish the previous key again (keep it for at least 24 h after each rotation); flush consumer JWKS caches.
+
+  - id: EVAL-102
+    title: Orders waiting for shipping labels
+    reported_at: "2026-12-04T10:30:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Warehouse says many orders have no label since early morning. Delivery quotes in checkout
+        are also slow. No sale running today.
+      alerts:
+        - "LabelFailureRate: 38% of label requests failing"
+        - "OrderHandoffDelay: oldest order waiting 74m"
+      logs:
+        - '2026-12-04T09:50:03Z order-worker ERROR label request failed: POST http://shipping-api.fulfilment.svc.cluster.local/v1/labels -> 503 {"error":"upstream","upstream_status":429}'
+        - '2026-12-04T09:50:10Z shipping-api WARN carrierhub POST /labels status=429 rate_limited=true current_rps=71'
+    label:
+      culprit_service: shipping-api
+      category: capacity / third-party rate limit
+      root_cause: >-
+        The label-prefetch job added by CHG-2353 sends thousands of label requests every ten minutes
+        through the same CarrierHub account, so together with normal traffic the account goes over
+        its 50 requests/s limit and CarrierHub throttles real label and quote requests.
+      key_facts:
+        - CHG-2353 requests labels for about 9,000 open orders every 10 minutes on the shared account.
+        - CarrierHub limit is 50 requests/s for quotes and labels together; logs show 71 rps and 429s.
+        - Same mechanism as PM-2026-010, which requires a capacity check for new CarrierHub traffic.
+      supporting_doc_ids: [kestrel/change/CHG-2353, kestrel/postmortem/PM-2026-010, kestrel/service/shipping-api]
+      root_cause_change: CHG-2353
+      expected_fix: Disable or throttle label-prefetch; add the client-side rate limiter (SHIP-52).
+
+  - id: EVAL-103
+    title: New products missing from search
+    reported_at: "2026-12-06T09:30:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Merchandising added 200 products on Friday and none of them can be found in search. Price
+        edits from Friday are not in search either. Search itself is fast and healthy. Search changed
+        its synonyms yesterday.
+      alerts:
+        - "SearchFreshness: newest indexed product update is 41h old"
+      logs:
+        - '2026-12-06T09:12:00Z search-indexer INFO consumer group search-indexer topic=catalog.product-updated lag=0 records_last_hour=0'
+        - '2026-12-06T09:12:00Z search-indexer INFO last record received at 2026-12-04T14:02:51Z'
+    label:
+      culprit_service: catalog-api
+      category: deploy regression / event contract
+      root_cause: >-
+        catalog-api v8.6 (CHG-2355) moved product events to a new v2 topic and stopped writing to the
+        old one, but the search-indexer still subscribes to the old topic, so it has received nothing
+        since the release and new or edited products never reach the index.
+      key_facts:
+        - The indexer is healthy with lag 0; it simply receives no records since 2026-12-04.
+        - CHG-2355 stopped publishing to catalog.product-updated in favour of the .v2 topic.
+        - The synonym change (CHG-2356) is query-time only.
+      supporting_doc_ids: [kestrel/change/CHG-2355, kestrel/service/search-api, kestrel/service/catalog-api]
+      root_cause_change: CHG-2355
+      expected_fix: Point the search-indexer at catalog.product-updated.v2 (or republish to the old topic) and reindex products changed since the release.
+
+  - id: EVAL-104
+    title: Old checkout page and old search ranking back
+    reported_at: "2026-12-07T15:20:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [shared-infra, recent-distractor]
+    incident:
+      reporter_note: >-
+        Since this afternoon some customers see the old checkout page and search ranking looks like
+        last summer. Storefront deployed the winter theme today, but checkout and search did not
+        deploy anything. It seems to affect pods that restarted today.
+      alerts:
+        - "FlagFetchErrors: 4 services reporting flag fetch failures"
+      logs:
+        - '2026-12-07T13:41:09Z checkout-api WARN FlagClient - fetch http://feature-flags.platform.svc.cluster.local/api/client/features failed: 404 Not Found; using compiled defaults'
+        - '2026-12-07T13:58:30Z search-api WARN flag-client fetch failed status=404 fallback=defaults'
+    label:
+      culprit_service: feature-flags
+      category: breaking API change / shared dependency
+      root_cause: >-
+        feature-flags v2.0 (CHG-2357) removed the endpoint the existing client SDKs poll; clients that
+        start after the release get 404 and run on compiled default flags, several of which are out
+        of date, so restarted pods show old features.
+      key_facts:
+        - Clients still call /api/client/features, which CHG-2357 removed; SDK 3.0 was only published that day.
+        - Only pods that restarted are affected because running clients keep their last good values.
+        - Same symptom pattern as PM-2026-011 (outdated compiled defaults).
+      supporting_doc_ids: [kestrel/change/CHG-2357, kestrel/postmortem/PM-2026-011, kestrel/service/feature-flags]
+      root_cause_change: CHG-2357
+      expected_fix: Restore the old endpoint (or roll back feature-flags v2.0) until all clients use SDK 3.0; restart affected pods.
+
+  - id: EVAL-105
+    title: Payment latency high while Paygate is healthy
+    reported_at: "2026-12-10T20:05:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, recent-distractor]
+    incident:
+      reporter_note: >-
+        payments-api p99 went from about 900 ms to 2.4 s since yesterday and some authorizations time
+        out. Paygate's status page is green and their own latency graph is flat. payments-api CPU is
+        three times higher than last week.
+      alerts:
+        - "PaymentsLatencyHigh: payments-api p99 2.41s"
+      logs:
+        - '2026-12-10T19:58:02Z payments-api level=info msg="paygate authorize" latency_ms=1870 new_conn=true tls_full_handshake=true handshake_ms=318'
+        - '2026-12-10T19:58:02Z payments-api level=info msg="paygate pool" idle=0 opened_last_min=1144'
+    label:
+      culprit_service: payments-api
+      category: config change / TLS connection reuse
+      root_cause: >-
+        The SEC-212 hardening (CHG-2359) turned off TLS session resumption and cut the keep-alive
+        idle time to 5 s, so almost every Paygate request opens a new connection with a full
+        mutual-TLS handshake, adding about 300 ms and a lot of CPU per authorization.
+      key_facts:
+        - Logs show new connections with full handshakes of about 318 ms.
+        - CHG-2359 disabled session tickets and lowered keep-alive idle timeout to 5 s.
+        - The logging update (CHG-2360) the same day has no functional change.
+      supporting_doc_ids: [kestrel/change/CHG-2359, kestrel/service/payments-api]
+      root_cause_change: CHG-2359
+      expected_fix: Restore connection reuse (longer idle timeout) and session resumption, or get a security exception for the Paygate client.
+
+  - id: EVAL-106
+    title: Stock reservations lagging
+    reported_at: "2026-12-11T14:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, recent-distractor]
+    incident:
+      reporter_note: >-
+        Reservation lag keeps growing since this morning, now 50 minutes. The consumer pods are up
+        and busy. inventory-api deployed a readiness endpoint yesterday.
+      alerts:
+        - "ReservationLagHigh: inventory-reserver lag 50m"
+        - "ConsumerRebalanceRate: inventory-reserver 14 rebalances/h"
+      logs:
+        - '2026-12-11T13:41:20Z inventory-api ERROR CommitFailedError: Commit cannot be completed since the group has already rebalanced. The time between subsequent calls to poll() was longer than the configured max.poll.interval.ms'
+        - '2026-12-11T13:41:21Z inventory-api INFO poll returned records=2000 batch_ms=402113'
+    label:
+      culprit_service: inventory-api
+      category: config change / consumer batch size
+      root_cause: >-
+        With max.poll.records raised to 2000 (CHG-2362), one batch at about 200 ms per message takes
+        roughly 400 s, beyond the 300 s max.poll.interval.ms, so the consumer is evicted, the batch is
+        re-delivered and the rebalance loop keeps lag growing.
+      key_facts:
+        - CHG-2362 raised max.poll.records from 500 to 2000 and left max.poll.interval.ms at 300 s.
+        - Batch time 402 s exceeds the 300 s poll interval.
+        - Same mechanism as PM-2025-019.
+      supporting_doc_ids: [kestrel/change/CHG-2362, kestrel/postmortem/PM-2025-019, kestrel/service/inventory-api]
+      root_cause_change: CHG-2362
+      expected_fix: Lower max.poll.records (to 50, as PM-2025-019 proposed) or raise max.poll.interval.ms.
+
+  - id: EVAL-107
+    title: Checkout slow but no errors
+    reported_at: "2026-12-14T13:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-2, culprit-unnamed, recent-distractor]
+    incident:
+      reporter_note: >-
+        Checkout p95 is around 2 s since yesterday, no errors. Checkout released gift wrap this
+        morning. The slow part seems to be the stock check, mostly for baskets with bundles.
+      alerts:
+        - "CheckoutLatencyHigh: checkout-api p95 2.1s"
+      logs:
+        - '2026-12-14T12:41:08Z checkout-api INFO AvailabilityClient GET /v2/availability took 1730ms items=4 bundles=1'
+        - '2026-12-14T12:41:08Z inventory-api INFO GET /v2/availability 200 total_ms=1702 bundle_resolve_ms=1655'
+    label:
+      culprit_service: catalog-api
+      category: config change / cache disabled
+      root_cause: >-
+        Switching off catalog-api's in-process cache (CHG-2365) sends every bundle lookup to
+        catalog-db; inventory-api resolves bundles through catalog-api on each availability call, so
+        checkout's stock check is slow two hops away from the change.
+      key_facts:
+        - The time is spent resolving bundles in inventory-api, which calls catalog-api.
+        - CHG-2365 disabled the cache that served about 85% of catalog reads.
+        - The gift wrap release (CHG-2366) does not touch stock calls.
+      supporting_doc_ids: [kestrel/change/CHG-2365, kestrel/service/catalog-api, kestrel/service/inventory-api]
+      root_cause_change: CHG-2365
+      expected_fix: Re-enable the catalog cache (or cache bundle lookups) while CAT-552 is investigated differently.
+
+  - id: EVAL-108
+    title: Lookup timeouts across services on sale evening
+    reported_at: "2026-12-15T18:40:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [shared-infra, recent-distractor, lexical-distractor]
+    incident:
+      reporter_note: >-
+        Sale evening. Small error spikes in search, order-worker and payments at the same time. Search
+        and order-worker both deployed today. CoreDNS runs its usual 6 replicas but they look busy.
+      alerts:
+        - "SearchErrorRateHigh: 1.6%"
+        - "OrderHandoffDelay: oldest order waiting 22m"
+        - "PaymentsErrorRateHigh: 1.2%"
+      logs:
+        - '2026-12-15T18:22:40Z payments-api level=error err="dial tcp: lookup api.paygate.example: i/o timeout"'
+        - '2026-12-15T18:22:41Z order-worker ERROR httpx.ConnectError: [Errno -3] Temporary failure in name resolution (shipping-api.fulfilment.svc.cluster.local)'
+        - 'coredns metrics: cache hit ratio 0.34 (last week 0.93); forward requests/s 5.8x last week'
+    label:
+      culprit_service: cluster-dns
+      category: config change / DNS cache
+      root_cause: >-
+        Lowering the CoreDNS cache lifetime to 5 s (CHG-2368) means far fewer answers come from cache,
+        so at sale load CoreDNS does several times more work and forwarding per lookup, saturates,
+        and lookups time out in every service.
+      key_facts:
+        - Errors in unrelated services at once, all DNS lookup failures.
+        - Cache hit ratio fell from 0.93 to 0.34 after CHG-2368 cut the cache TTL from 30 s to 5 s.
+        - Replicas are at 6, so the older CoreDNS replica change (CHG-2336) is not the cause this time.
+        - Same family as PM-2025-022 (CoreDNS saturation, ndots amplification).
+      supporting_doc_ids: [kestrel/change/CHG-2368, kestrel/postmortem/PM-2025-022, kestrel/service/cluster-dns]
+      root_cause_change: CHG-2368
+      expected_fix: Restore the 30 s cache TTL and scale CoreDNS for the sale.
+
+  - id: EVAL-109
+    title: Order confirmation emails delayed during campaign
+    reported_at: "2026-12-17T11:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, no-change, recent-distractor]
+    incident:
+      reporter_note: >-
+        Confirmation emails are 40 minutes behind. Marketing started the Christmas campaign at 10:00.
+        We deployed a new email template yesterday.
+      alerts:
+        - "EmailQueueBacklog: 61,000 messages, oldest 41m"
+      logs:
+        - '2026-12-17T10:31:12Z notification-service warn sender status=429 retry_in=30s honoured_retry_after=true attempt=2'
+        - '2026-12-17T10:31:12Z notification-service info postrelay account usage 100/100 msg/s'
+    label:
+      culprit_service: notification-service
+      category: capacity / shared third-party limit
+      root_cause: >-
+        The marketing campaign uses the PostRelay account that transactional email shares, so the
+        account sits at its 100 messages/s limit; retries already back off correctly, but
+        confirmations simply queue behind the campaign. No change caused it; the separate sub-account
+        from PM-2026-004 was never created.
+      key_facts:
+        - Retries honour Retry-After, so this is not the retry storm of PM-2026-004 or the v2.4 regression.
+        - Account usage is at 100/100 msg/s during the campaign.
+        - The template change (CHG-2372) did not touch sending logic.
+      supporting_doc_ids: [kestrel/postmortem/PM-2026-004, kestrel/service/notification-service]
+      expected_fix: Throttle or pause the campaign; create the separate transactional sub-account.
+
+  - id: EVAL-110
+    title: order-worker restarting, orders stuck
+    reported_at: "2026-12-18T10:20:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, lexical-distractor]
+    incident:
+      reporter_note: >-
+        order-worker pods keep restarting since yesterday afternoon, orders reach the warehouse late.
+        The memory limit was already put back to 1Gi at the start of the month.
+      alerts:
+        - "OrderHandoffDelay: oldest order waiting 48m"
+        - "KubePodCrashLooping: order-worker"
+      logs:
+        - 'kubectl describe pod order-worker-7c9d5-k2xq: Last State: Terminated, Reason: OOMKilled, Exit Code: 137; Limits: memory 1Gi'
+        - '2026-12-18T10:02:51Z order-worker INFO building packing slip order=K-8812031 lines=14 images=14'
+    label:
+      culprit_service: order-worker
+      category: deploy regression / memory
+      root_cause: >-
+        Since v4.9 (CHG-2374) order-worker renders packing-slip PDFs itself with full-resolution
+        product images, which pushes peak memory past the 1Gi limit on multi-item orders; the pods
+        are OOMKilled and crash-loop.
+      key_facts:
+        - Crashes started after CHG-2374 moved PDF rendering in-process.
+        - OOMKilled with a 1Gi limit while building packing slips with many images.
+        - CHG-2361 (limit back to 1Gi) is not the cause; PM-2026-005 shows the same OOM mechanism.
+      supporting_doc_ids: [kestrel/change/CHG-2374, kestrel/postmortem/PM-2026-005, kestrel/service/order-worker]
+      root_cause_change: CHG-2374
+      expected_fix: Roll back v4.9 (or downscale images and raise the limit from measured peak plus headroom).
+
+  - id: EVAL-111
+    title: Product pages show old prices
+    reported_at: "2026-12-20T09:40:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, lexical-distractor]
+    incident:
+      reporter_note: >-
+        Prices were updated at 09:00 for the sale but product pages still show yesterday's prices.
+        The checkout total is correct. Catalog shipped a price rounding fix yesterday.
+      alerts: []
+      logs:
+        - 'curl -sI https://www.kestrel.example/api/price/KS-10213 -> 200, age: 2410, x-cache: HIT'
+        - '2026-12-20T09:30:00Z catalog-api INFO GET /v1/prices/KS-10213 price=39.99 updated_at=2026-12-20T09:00:04Z'
+    label:
+      culprit_service: web-storefront
+      category: config change / CDN caching
+      root_cause: >-
+        The CDN rule added in CHG-2376 caches the price API at the edge for an hour, so product pages
+        read cached prices even though catalog-api already returns the new ones.
+      key_facts:
+        - The CDN answers /api/price from cache (x-cache HIT, age 2410 s); catalog-api has the new price.
+        - CHG-2376 caches /api/price/* for 1 hour.
+        - Same mechanism as PM-2026-007; the rounding fix (CHG-2377) is unrelated.
+      supporting_doc_ids: [kestrel/change/CHG-2376, kestrel/postmortem/PM-2026-007, kestrel/service/web-storefront]
+      root_cause_change: CHG-2376
+      expected_fix: Remove the /api/price/* rule and purge the CDN cache.
+
+  - id: EVAL-112
+    title: Sign-ins failing
+    reported_at: "2026-12-19T21:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-0, old-culprit, recent-distractor]
+    incident:
+      reporter_note: >-
+        Customers cannot sign in since about 20:30; existing sessions still work. auth-service only
+        changed email text yesterday.
+      alerts:
+        - "SignInFailureRate: auth-service 64%"
+        - "RedisMemoryHigh: session-store used_memory 100% of maxmemory"
+      logs:
+        - '2026-12-19T20:41:10Z auth-service level=error msg="session save failed" err="OOM command not allowed when used memory > ''maxmemory''."'
+        - '2026-12-19T20:41:30Z session-store INFO keyspace: db0 keys=2281903 expires=391022'
+    label:
+      culprit_service: auth-service
+      category: deploy change / unbounded growth
+      root_cause: >-
+        Since v4.2 (CHG-2314, seven weeks earlier) remember-me sessions never expire, so session-store
+        grew steadily until it reached its 2 GB maxmemory; with noeviction Redis rejects new session
+        writes and sign-ins fail.
+      key_facts:
+        - Most keys have no expiry (keys 2.28M, expires 0.39M).
+        - CHG-2314 stores remember-me sessions without a TTL; about 40 MB of sessions per day accumulate.
+        - session-store uses noeviction, so a full store rejects writes.
+      supporting_doc_ids: [kestrel/change/CHG-2314, kestrel/service/auth-service]
+      root_cause_change: CHG-2314
+      expected_fix: Give remember-me sessions a TTL (e.g. 30 days), clean up old keys, raise memory temporarily.
+
+  - id: EVAL-113
+    title: Payments failing at holiday peak
+    reported_at: "2026-12-28T19:20:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, lexical-distractor, recent-distractor]
+    incident:
+      reporter_note: >-
+        About 9% of payments fail with 503 since 19:00. The PgBouncer pool was put back to 60 earlier
+        this month. payments-api deployed 3-D Secure text changes yesterday.
+      alerts:
+        - "PaymentsErrorRateHigh: payments-api 5xx ratio 9.1%"
+        - "PgBouncerClientsWaiting: pool payments-db/payments cl_waiting=84 for 5m"
+      logs:
+        - '2026-12-28T19:06:14Z payments-api level=error msg="authorize failed" err="timeout acquiring connection from pool after 5s"'
+        - '2026-12-28T19:07:00Z pgbouncer LOG stats: payments-db/payments cl_active=60 cl_waiting=84 sv_active=60 sv_idle=0'
+    label:
+      culprit_service: payments-api
+      category: capacity / connection pool
+      root_cause: >-
+        Scaling payments-api to 10 replicas (CHG-2380) without resizing PgBouncer raised peak client
+        demand to around 200 connections against 60 server connections, so at the evening peak
+        requests queue at PgBouncer and time out.
+      key_facts:
+        - sv_active pinned at 60 with 84 clients waiting.
+        - CHG-2380 raised replicas to 10 with 20 connections each; the pool stayed at 60 (CHG-2354).
+        - Same mechanism as PM-2025-007 (scaled the app but not the pooler).
+      supporting_doc_ids: [kestrel/change/CHG-2380, kestrel/postmortem/PM-2025-007, kestrel/service/payments-api]
+      root_cause_change: CHG-2380
+      expected_fix: Apply the PM-2025-007 capacity rule (raise default_pool_size with headroom or lower per-replica pools).
+
+  - id: EVAL-114
+    title: Customers losing their carts
+    reported_at: "2026-12-30T15:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, recent-distractor]
+    incident:
+      reporter_note: >-
+        Support has many tickets about empty carts today. Checkout released an express checkout
+        button this morning.
+      alerts:
+        - "CartRecreateRate: 5.4% of sessions rebuilt their cart"
+      logs:
+        - '2026-12-30T14:40:02Z cart-cache INFO stats: evicted_keys=1820331 used_memory=4.00G maxmemory_policy=allkeys-lru'
+        - '2026-12-30T14:40:05Z checkout-api WARN CartStore - cart not found for active session s-77a1'
+    label:
+      culprit_service: checkout-api
+      category: config change / cache eviction policy
+      root_cause: >-
+        CHG-2383 switched cart-cache to allkeys-lru, so when memory is full Redis evicts any key,
+        including carts that customers are still using, instead of only keys with a TTL.
+      key_facts:
+        - evicted_keys is high with policy allkeys-lru.
+        - CHG-2383 changed the policy back to allkeys-lru, undoing CHG-2201.
+        - Same mechanism as PM-2026-002.
+      supporting_doc_ids: [kestrel/change/CHG-2383, kestrel/change/CHG-2201, kestrel/postmortem/PM-2026-002, kestrel/service/checkout-api]
+      root_cause_change: CHG-2383
+      expected_fix: Restore volatile-lru and fix the memory pressure (TTLs, cleaner, more memory).
+
+  - id: EVAL-115
+    title: Product pages returning 504
+    reported_at: "2027-01-03T10:25:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Product and cart pages time out since about 10:00. Storefront deployed new search suggestions
+        this morning.
+      alerts:
+        - "StorefrontErrorRateHigh: 504 ratio 22%"
+        - "CatalogLatencyHigh: catalog-api p95 9.8s"
+      logs:
+        - '2027-01-03T10:08:51Z catalog-api ERROR SQL error: canceling statement due to lock timeout (SELECT ... FROM product_variant WHERE sku = $1)'
+        - "catalog-db pg_locks: 1 granted RowExclusiveLock on product_variant held 00:24:10 by pid 41212 (flyway); 380 waiting"
+    label:
+      culprit_service: catalog-api
+      category: migration / table locks
+      root_cause: >-
+        Migration V93 (CHG-2386) rewrites every product_variant row in one long transaction, holding
+        row locks for its whole duration; reads that need those rows wait, hit the lock timeout, and
+        storefront calls to catalog-api time out.
+      key_facts:
+        - A Flyway session has held locks on product_variant for 24 minutes.
+        - CHG-2386 backfills all 42M rows in a single transaction at deploy.
+        - The storefront deploy (CHG-2387) does not touch product pages.
+      supporting_doc_ids: [kestrel/change/CHG-2386, kestrel/service/catalog-api]
+      root_cause_change: CHG-2386
+      expected_fix: Cancel the migration transaction; redo the backfill in small batches.
+
+  - id: EVAL-116
+    title: Orders not handed to the warehouse
+    reported_at: "2027-01-05T16:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Since early afternoon no orders reach the warehouse. Labels seem to be created fine.
+        order-worker concurrency was raised yesterday.
+      alerts:
+        - "OrderHandoffDelay: oldest order waiting 2h10m"
+      logs:
+        - "2027-01-05T13:44:02Z order-worker ERROR handoff failed order=K-9010021: KeyError: 'tracking_number'"
+        - "2027-01-05T13:44:02Z order-worker INFO label created status=201 body_keys=[tracking_id, carrier, label_url]"
+    label:
+      culprit_service: shipping-api
+      category: breaking API change
+      root_cause: >-
+        shipping-api v2.4 (CHG-2389) renamed the label response field that order-worker copies into
+        the warehouse hand-off, so order-worker fails on the missing field even though labels are
+        created successfully.
+      key_facts:
+        - Response keys now contain tracking_id instead of tracking_number.
+        - order-worker requires tracking_number for the hand-off (service notes).
+        - The concurrency change (CHG-2390) does not change the hand-off.
+      supporting_doc_ids: [kestrel/change/CHG-2389, kestrel/service/shipping-api, kestrel/service/order-worker]
+      root_cause_change: CHG-2389
+      expected_fix: Roll back shipping-api v2.4 or return both fields, then update order-worker.
+
+  - id: EVAL-117
+    title: Search slow, OpenSearch CPU high
+    reported_at: "2027-01-07T12:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, recent-distractor, after-distractor]
+    incident:
+      reporter_note: >-
+        Search p95 is 1.6 s since yesterday and search-prod data nodes sit at 90% CPU. Traffic is
+        normal. Catalog shipped dependency updates yesterday.
+      alerts:
+        - "SearchLatencyHigh: p95 1.62s"
+        - "OpenSearchCPUHigh: search-prod data nodes 91%"
+      logs:
+        - 'search-prod slowlog: took[1.4s] query={"multi_match":{"query":"cusion cover","fields":["title","description","brand","attributes.*"],"fuzziness":"AUTO"}}'
+    label:
+      culprit_service: search-api
+      category: config change / query cost
+      root_cause: >-
+        Applying fuzzy matching to every text field (CHG-2392) multiplies the work per query on large
+        fields like description and attributes; search-prod, sized for title-only fuzziness, runs out
+        of CPU and latency rises.
+      key_facts:
+        - The slow log shows fuzziness AUTO across description, brand and attributes.
+        - CHG-2392 extended fuzziness from title to all fields.
+        - Cluster was sized for about 35% CPU with title-only fuzziness.
+      supporting_doc_ids: [kestrel/change/CHG-2392, kestrel/service/search-api]
+      root_cause_change: CHG-2392
+      expected_fix: Revert fuzziness to the title field (or restrict to short fields) and re-measure.
+
+  - id: EVAL-118
+    title: Pods slow to start, flag fetch timeouts
+    reported_at: "2027-01-09T10:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [shared-infra, recent-distractor]
+    incident:
+      reporter_note: >-
+        Since yesterday new pods in checkout and search take minutes to become ready, and some
+        features flicker. Checkout deployed saved cards this morning.
+      alerts:
+        - "FlagFetchErrors: 4 services reporting flag fetch timeouts"
+        - "KubeDeploymentRolloutStuck: checkout-api"
+      logs:
+        - '2027-01-09T09:31:12Z checkout-api WARN FlagClient - fetch timed out after 2000ms (attempt 3)'
+        - '2027-01-09T09:31:40Z feature-flags INFO requests_per_s=412 p99_ms=2840 cpu=98%'
+    label:
+      culprit_service: feature-flags
+      category: config change / self-inflicted load
+      root_cause: >-
+        CHG-2395 made every flag client poll once a second instead of every 30 s, a roughly 30-fold
+        load increase on a flag service sized for the old interval; it saturates, fetches time out
+        and pods wait for flags at startup.
+      key_facts:
+        - feature-flags handles about 412 req/s (sized for about 13 at a 30 s interval) at 98% CPU.
+        - CHG-2395 lowered the polling interval for all clients via the server setting.
+        - Clients fall back to defaults when fetches fail (PM-2026-011).
+      supporting_doc_ids: [kestrel/change/CHG-2395, kestrel/postmortem/PM-2026-011, kestrel/service/feature-flags]
+      root_cause_change: CHG-2395
+      expected_fix: Restore the 30 s interval (use push or a separate kill-switch channel instead).
+
+  - id: EVAL-119
+    title: All payments rejected by Paygate
+    reported_at: "2027-01-11T08:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, lexical-distractor]
+    incident:
+      reporter_note: >-
+        Every payment has failed since about 22:05 last night. The Paygate CA bundle was updated for
+        G3 in November and the client certificate is valid for another 80 days.
+      alerts:
+        - "PaymentsErrorRateHigh: payments-api 5xx ratio 100%"
+      logs:
+        - '2027-01-10T22:05:31Z payments-api level=error msg="paygate authorize" err="remote error: tls: unknown certificate authority"'
+        - 'openssl x509 -in paygate-client.crt -noout -issuer -enddate: issuer=CN=Kestrel Internal CA v2, notAfter=Apr 10 22:00:00 2027 GMT'
+    label:
+      culprit_service: payments-api
+      category: infra change / client certificate trust
+      root_cause: >-
+        CHG-2399 had cert-manager re-issue the Paygate client certificate from the new internal CA,
+        which Paygate does not trust; Paygate rejects the mutual-TLS handshake from the moment the
+        new certificate was loaded.
+      key_facts:
+        - The error comes from Paygate's side (remote error, unknown certificate authority).
+        - The client certificate is now issued by Kestrel Internal CA v2 since 2027-01-10 22:00 (CHG-2399).
+        - Paygate only accepts certificates from Kestrel Partner CA; the server-chain issue (CHG-2302) is unrelated.
+      supporting_doc_ids: [kestrel/change/CHG-2399, kestrel/postmortem/PM-2025-015, kestrel/service/payments-api]
+      root_cause_change: CHG-2399
+      expected_fix: Re-issue paygate-client from the Kestrel Partner CA issuer and exclude it from the CA consolidation.
+
+  - id: EVAL-120
+    title: Stock check failing with database errors
+    reported_at: "2027-01-13T18:30:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0]
+    incident:
+      reporter_note: >-
+        January sale evening. Checkout fails at the stock check for about 12% of customers.
+        inventory-api scaled out to many pods.
+      alerts:
+        - "CheckoutErrorRateHigh: 12%"
+        - "InventoryErrorRateHigh: inventory-api 5xx 13%"
+      logs:
+        - '2027-01-13T18:12:03Z inventory-api ERROR asyncpg.exceptions.TooManyConnectionsError: sorry, too many clients already'
+        - 'kubectl get hpa inventory-api: REPLICAS 21, MINPODS 3, MAXPODS 24'
+    label:
+      culprit_service: inventory-api
+      category: capacity / database connections
+      root_cause: >-
+        Raising the inventory-api HPA ceiling to 24 (CHG-2401) lets the sale scale it to 21 pods with
+        10 connections each, past inventory-db's limit of 150 connections, so new connections are
+        refused and availability calls fail.
+      key_facts:
+        - 21 replicas x 10 connections = 210 > max_connections 150.
+        - CHG-2401 raised the HPA maximum from 8 to 24 without changing the pool.
+      supporting_doc_ids: [kestrel/change/CHG-2401, kestrel/service/inventory-api]
+      root_cause_change: CHG-2401
+      expected_fix: Cap replicas so the pools fit, or add a pooler in front of inventory-db.
+
+  - id: EVAL-121
+    title: Customers signed out after card authentication
+    reported_at: "2027-01-15T20:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, culprit-unnamed, recent-distractor]
+    incident:
+      reporter_note: >-
+        Customers paying by card are sent to the sign-in page when they come back from their bank's
+        verification step, and the order is lost. Storefront changed footer links today.
+      alerts:
+        - "CheckoutConversionDrop: card payments completion -37%"
+      logs:
+        - '2027-01-15T19:41:20Z web-storefront INFO GET /checkout/return 302 -> /signin reason=no_session_cookie referer=https://acs.examplebank.example/'
+    label:
+      culprit_service: auth-service
+      category: config change / cookie policy
+      root_cause: >-
+        CHG-2403 made the session cookie SameSite=Strict, and browsers do not send Strict cookies on
+        the cross-site redirect back from the bank's 3-D Secure page, so the storefront sees no
+        session at /checkout/return.
+      key_facts:
+        - The return request comes from the bank's site and arrives without the session cookie.
+        - CHG-2403 changed SameSite from Lax to Strict; Lax was chosen for this redirect.
+      supporting_doc_ids: [kestrel/change/CHG-2403, kestrel/service/auth-service, kestrel/service/web-storefront]
+      root_cause_change: CHG-2403
+      expected_fix: Revert the session cookie to SameSite=Lax.
+
+  - id: EVAL-122
+    title: Checkout delivery options timing out
+    reported_at: "2027-01-17T13:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        The delivery step in checkout often shows "no delivery options". Checkout released promo
+        code validation yesterday.
+      alerts:
+        - "CheckoutLatencyHigh: checkout-api p95 3.4s"
+      logs:
+        - '2027-01-17T12:31:09Z checkout-api WARN ShippingClient GET /v1/quotes timed out after 3000ms'
+        - '2027-01-17T12:31:10Z shipping-api INFO quote carrierhub_ms=2710 cache=disabled'
+        - '2027-01-17T12:31:11Z shipping-api WARN carrierhub status=429 rate_limited=true'
+    label:
+      culprit_service: shipping-api
+      category: config change / cache disabled
+      root_cause: >-
+        With the carrier rate cache switched off (CHG-2406), every checkout quote goes live to
+        CarrierHub; quotes now take close to 3 s and push the shared account into rate limiting, so
+        checkout's 3 s quote call times out.
+      key_facts:
+        - Logs show cache=disabled and CarrierHub calls of about 2.7 s plus 429s.
+        - CHG-2406 disabled the 15-minute rate cache (about 92% hit rate).
+        - Quotes and labels share the 50 requests/s limit (PM-2026-010).
+      supporting_doc_ids: [kestrel/change/CHG-2406, kestrel/service/shipping-api, kestrel/postmortem/PM-2026-010]
+      root_cause_change: CHG-2406
+      expected_fix: Re-enable the rate cache (shorter TTL if freshness matters).
+
+  - id: EVAL-123
+    title: Order emails bouncing
+    reported_at: "2027-01-19T09:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, rolled-back-distractor]
+    incident:
+      reporter_note: >-
+        No order confirmations delivered since yesterday afternoon. There was a template engine
+        release yesterday but it was rolled back.
+      alerts:
+        - "EmailSendFailures: 100% permanent failures"
+      logs:
+        - '2027-01-19T08:40:02Z notification-service error postrelay send failed status=550 reason="5.7.26 Unauthenticated email from mail.kestrel.example is not accepted"'
+    label:
+      culprit_service: notification-service
+      category: config change / sender authentication
+      root_cause: >-
+        CHG-2410 moved the sender to the new mail.kestrel.example domain before its SPF and DKIM
+        records existed, so PostRelay permanently rejects the unauthenticated messages.
+      key_facts:
+        - 550 5.7.26 for the new sender domain.
+        - CHG-2410 changed the From domain while DNS records were only requested (NET-118).
+        - The template engine release (CHG-2409) was rolled back.
+      supporting_doc_ids: [kestrel/change/CHG-2410, kestrel/service/notification-service]
+      root_cause_change: CHG-2410
+      expected_fix: Switch the sender back to orders@kestrel.example until SPF/DKIM are published; resend failed emails.
+
+  - id: EVAL-124
+    title: Product API slow
+    reported_at: "2027-01-21T14:00:00Z"
+    answerable: true
+    reasoning: single-hop
+    tags: [hop-0, after-distractor]
+    incident:
+      reporter_note: >-
+        catalog-api p95 is 2.8 s since yesterday's release; product pages are slow.
+      alerts:
+        - "CatalogLatencyHigh: catalog-api p95 2.8s"
+      logs:
+        - 'pg_stat_statements: SELECT * FROM variant_attribute WHERE variant_id = $1 calls=48210331 mean_ms=1.9'
+        - 'EXPLAIN SELECT * FROM variant_attribute WHERE variant_id = 9921: Seq Scan on variant_attribute (rows=3120440)'
+    label:
+      culprit_service: catalog-api
+      category: deploy regression / N+1 query
+      root_cause: >-
+        catalog-api v8.9 (CHG-2413) loads attributes with a separate query for each variant, and that
+        query has no index on variant_id, so each product request runs many sequential scans.
+      key_facts:
+        - Tens of millions of per-variant attribute queries, each a Seq Scan.
+        - CHG-2413 added one query per variant to the product response.
+        - The index (CHG-2414) is dated after the incident; PM-2025-024 required EXPLAIN plans for hot queries.
+      supporting_doc_ids: [kestrel/change/CHG-2413, kestrel/service/catalog-api, kestrel/postmortem/PM-2025-024]
+      root_cause_change: CHG-2413
+      expected_fix: Roll back v8.9 or batch the attribute query, and add the variant_id index.
+
+  - id: EVAL-125
+    title: Checkout rejecting payments under load
+    reported_at: "2027-01-23T19:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-1, recent-distractor]
+    incident:
+      reporter_note: >-
+        Checkout returns 503 for about a quarter of orders at the payment step. Paygate's status page
+        says "degraded performance". Checkout added promo code validation last week.
+      alerts:
+        - "CheckoutErrorRateHigh: 24%"
+      logs:
+        - '2027-01-23T18:44:01Z checkout-api ERROR PaymentExecutor - rejected: pool exhausted (active=50, queue=0)'
+        - '2027-01-23T18:44:02Z payments-api level=info msg="paygate authorize" latency_ms=13870'
+    label:
+      culprit_service: payments-api
+      category: config change / timeout amplification
+      root_cause: >-
+        Raising the Paygate request timeout to 15 s (CHG-2417) means that during Paygate's slowdown
+        each payment holds a checkout worker thread for up to 15 s instead of failing fast at 2 s;
+        checkout's 50 payment threads fill up and new payments are rejected.
+      key_facts:
+        - payments-api waits almost 14 s for Paygate; checkout's 50-thread payment pool is exhausted.
+        - CHG-2417 raised the timeout from 2 s to 15 s the day before.
+      supporting_doc_ids: [kestrel/change/CHG-2417, kestrel/service/payments-api, kestrel/service/checkout-api]
+      root_cause_change: CHG-2417
+      expected_fix: Restore the 2 s timeout (or add a circuit breaker on Paygate calls).
+
+  - id: EVAL-126
+    title: Reservations and availability slowing down
+    reported_at: "2027-01-25T16:00:00Z"
+    answerable: true
+    reasoning: multi-hop
+    tags: [hop-0, old-culprit, recent-distractor]
+    incident:
+      reporter_note: >-
+        Reservation lag has been creeping up for days and availability calls got slower each week.
+        inventory-api changed its log format yesterday and the consumer membership today.
+      alerts:
+        - "ReservationLagHigh: inventory-reserver lag 22m"
+        - "InventoryLatencyHigh: /v2/availability p95 640ms"
+      logs:
+        - 'inventory-db: SELECT relname, n_live_tup, n_dead_tup, last_autovacuum FROM pg_stat_user_tables -> reservations 2,104,331 | 412,880,120 | 2026-12-11 23:10'
+        - 'inventory-db: reservations total size 61 GB'
+    label:
+      culprit_service: inventory-api
+      category: config change / table bloat
+      root_cause: >-
+        Autovacuum on the reservations table was switched off for the stock import (CHG-2364) six
+        weeks ago and never turned back on; with millions of updates a day, dead rows piled up and
+        the bloated table makes every reservation and availability query slower.
+      key_facts:
+        - 412M dead tuples and 61 GB; last autovacuum on 2026-12-11.
+        - CHG-2364 disabled autovacuum on reservations, to be re-enabled after the import (FUL-401).
+        - Slow per-message processing leads to lag as in PM-2025-019.
+      supporting_doc_ids: [kestrel/change/CHG-2364, kestrel/service/inventory-api, kestrel/postmortem/PM-2025-019]
+      root_cause_change: CHG-2364
+      expected_fix: Re-enable autovacuum, run VACUUM (or pg_repack) on reservations.
+
+  - id: EVAL-127
+    title: Sign-in codes by SMS delayed in Brazil
+    reported_at: "2027-01-26T13:00:00Z"
+    answerable: false
+    reasoning: unanswerable
+    tags: [no-evidence]
+    incident:
+      reporter_note: >-
+        Customers in Brazil say one-time sign-in codes by SMS arrive 10 minutes late. Other countries
+        are fine.
+      alerts: []
+      logs:
+        - 'sms delivery report: country=BR median_delivery_s=604'
+    label:
+      culprit_service: null
+      category: null
+      root_cause: null
+      expected_fix: null
+
+  - id: EVAL-128
+    title: Kafka under-replicated partitions after broker replacement
+    reported_at: "2027-01-27T07:30:00Z"
+    answerable: false
+    reasoning: unanswerable
+    tags: [no-evidence]
+    incident:
+      reporter_note: >-
+        After broker 2 was replaced last night, 37 partitions are still under-replicated.
+      alerts:
+        - "KafkaUnderReplicatedPartitions: 37"
+      logs:
+        - '2027-01-27T07:10:00Z kafka-2 INFO [ReplicaFetcher replicaId=2] fetching 37 partitions, throttled=true'
+    label:
+      culprit_service: null
+      category: null
+      root_cause: null
+      expected_fix: null
+
+  - id: EVAL-129
+    title: Mobile app crashes on launch
+    reported_at: "2027-01-28T10:00:00Z"
+    answerable: false
+    reasoning: unanswerable
+    tags: [no-evidence]
+    incident:
+      reporter_note: >-
+        App store reviews say the iOS app crashes at launch since the latest iOS update.
+      alerts: []
+      logs:
+        - 'crash report: EXC_BAD_ACCESS in ImageCarousel.swift:212'
+    label:
+      culprit_service: null
+      category: null
+      root_cause: null
+      expected_fix: null
+
+  - id: EVAL-130
+    title: Warehouse scanners offline at one site
+    reported_at: "2027-01-29T06:20:00Z"
+    answerable: false
+    reasoning: unanswerable
+    tags: [no-evidence]
+    incident:
+      reporter_note: >-
+        Handheld scanners at the Lyon warehouse cannot connect since the start of the shift. Other
+        sites work.
+      alerts: []
+      logs:
+        - 'scanner-gw-lyon: wlan0 association failed (reason 15)'
+    label:
+      culprit_service: null
+      category: null
+      root_cause: null
+      expected_fix: null

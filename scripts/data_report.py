@@ -15,9 +15,15 @@ from collections import Counter
 
 from ragnition.core.config import PROJECT_ROOT
 from ragnition.data.manifest import Manifest, sha256_bytes
-from ragnition.data.paths import EVAL_SCENARIOS_PATH, MANIFEST_PATH, LeakageError, ensure_corpus_path
+from ragnition.data.paths import (
+    EVAL_SCENARIOS_PATH,
+    EVAL_TEST_SCENARIOS_PATH,
+    MANIFEST_PATH,
+    LeakageError,
+    ensure_corpus_path,
+)
 from ragnition.data.synthetic import find_leaks
-from ragnition.data.world import load_eval_set
+from ragnition.data.world import load_all_eval
 
 
 def main() -> int:
@@ -51,7 +57,7 @@ def main() -> int:
             problems.append(f"{r.doc_id}: file changed since it was recorded")
         texts[r.doc_id] = data.decode("utf-8", errors="replace")
 
-    evalset = load_eval_set(EVAL_SCENARIOS_PATH)
+    evalset = load_all_eval(EVAL_SCENARIOS_PATH, EVAL_TEST_SCENARIOS_PATH)
     needed = {d for s in evalset.scenarios for d in s.label.supporting_doc_ids}
     missing = sorted(needed - set(texts))
     if missing:

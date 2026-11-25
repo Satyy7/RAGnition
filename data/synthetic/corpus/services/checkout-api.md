@@ -13,6 +13,9 @@ Cart and checkout orchestration. Holds carts in Redis, reserves stock, takes pay
 Calls:
 - inventory-api
 - payments-api
+- auth-service
+- shipping-api
+- feature-flags
 
 Called by:
 - web-storefront
@@ -29,6 +32,9 @@ Called by:
 
 - Carts are Redis keys `cart:{session}`; the platform rule is that every key carries a TTL (carts 7 days).
 - Calls inventory-api `GET /v2/availability` before reserving stock and maps the JSON response to a strict DTO (unknown or missing required fields fail deserialization).
+- Customer requests carry a JWT issued by auth-service; checkout-api verifies it against the auth-service JWKS, which it caches for 24 h.
+- Delivery options and prices come from shipping-api `GET /v1/quotes` (timeout 3 s).
+- Payment calls to payments-api run on a bounded pool of 50 worker threads with a 20 s timeout.
 
 ## Known failure modes
 

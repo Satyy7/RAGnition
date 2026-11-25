@@ -12,6 +12,7 @@ Product search and the search-indexer job that writes catalog updates into OpenS
 
 Calls:
 - catalog-api
+- feature-flags
 
 Called by:
 - web-storefront
@@ -29,6 +30,8 @@ Called by:
 - OpenSearch disk watermarks are defaults (low 85%, high 90%, flood_stage 95%).
 - At flood_stage OpenSearch puts index.blocks.read_only_allow_delete on indices with a shard on that node.
 - The query log indices search-querylog-* are managed by an index lifecycle policy (retention setting).
+- The search-indexer reads catalog change events from the Kafka topic `catalog.product-updated`.
+- Text queries match the title field with fuzziness AUTO and other fields exactly; search-prod is sized for this at about 35% CPU at peak.
 
 ## Known failure modes
 

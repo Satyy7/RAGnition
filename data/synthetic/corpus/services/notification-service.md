@@ -28,6 +28,7 @@ Called by:
 
 - Marketing campaigns share the same PostRelay account and limit.
 - Retry policy must honour Retry-After and use exponential backoff with jitter (PM-2026-004).
+- PostRelay rejects mail from a sender domain without published SPF and DKIM records (permanent error 550 5.7.26).
 
 ## Known failure modes
 
