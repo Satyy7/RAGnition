@@ -166,6 +166,25 @@ Pre-registered claim: on test, root-cause-change Recall@5 of the full system
 beats adaptive RRF, with a paired 95% bootstrap CI above 0. It is compared against
 a naive "newest change on the named services" baseline, not only against text search.
 
+**Result (test run #1, 2026-11-25, 26 answerable held-out incidents):**
+
+| system | root-cause change R@5 | root-cause MRR | nDCG@10 (graded) |
+|---|---:|---:|---:|
+| BM25 | 0.64 | 0.26 | 0.59 |
+| RRF (BM25 + dense, adaptive) | 0.44 | 0.20 | 0.53 |
+| RRF + newest changes on named services (naive) | 0.76 | 0.62 | 0.63 |
+| **RRF + change-aware (full)** | **0.88** | **0.73** | **0.73** |
+
+- Pre-registered claim supported: full - adaptive RRF on R@5 = +0.44, 95% CI [0.20, 0.68].
+- Against the naive baseline: +0.12, CI [-0.08, 0.32], not significant overall. The
+  gain is where the graph matters (1-hop culprits 0.88 vs 0.50; culprit never named
+  2/2 vs 0/2; lexical decoys 5/5 vs 4/5), but those slices are small.
+- Failure: both old-culprit incidents (44 and 50 days) are missed, because of the 21-day window,
+  as designed. Slow-burn causes need another signal (e.g. trend detection).
+- Negative result: adaptive fusion weighting hurt nDCG (-0.04, CI [-0.09, -0.01]);
+  plain RRF is kept from M7 on. This decision was made after the test run, so it
+  is not claimed as a measured improvement.
+
 **Limits.** The test set and the scorer share an author; freezing first and the
 adversarial cases reduce that bias but do not remove it. The data is synthetic and
 the service registry is complete, which real CMDBs rarely are. The approach is
