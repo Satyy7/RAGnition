@@ -1,0 +1,18 @@
+# Written by scripts/run_m6_benchmark.py --split dev --apply (tuned on DEV incidents only).
+window_days: 21
+tau_days: 5
+max_hops: 2
+proximity:
+- 1.0
+- 0.4
+- 0.16
+risk:
+  config: 1.0
+  deploy: 0.9
+  migration: 0.9
+  infra: 0.8
+  vendor-notice: 0.7
+open_risk_recency: 0.5
+fusion_weight: 2.0
+top_n: 20
+chosen_by: m6 dev grid 2026-11-25

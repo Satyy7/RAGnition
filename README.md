@@ -128,3 +128,46 @@ on judge-checked synthetic queries plus the hand-labelled incidents. Results car
 before the run: highest combined dense+BM25 Recall@10, and among statistically
 tied configs the one with the fewest vectors. The choice is written to
 `config/retrieval.yaml`; reports are in `data/eval/results/`.
+
+Result (2026-11-24): all eight configs were statistically tied on Recall@10
+(0.98-0.99, a ceiling effect: the generated queries are easy), so the rule picked
+`fixed-510`, the cheapest (1,105 vectors vs up to 4,810). The query instruction
+helped dense search slightly. The real bottleneck showed up in the incident slice:
+root-cause change records are rarely retrieved, whatever the chunking.
+
+## Change-aware retrieval (M6)
+
+```powershell
+uv run python scripts/run_m6_benchmark.py --split dev --apply   # tune on the 10 dev incidents
+uv run python scripts/run_m6_benchmark.py --split test          # score the frozen test set once
+```
+
+Symptoms ("checkout 503s") share almost no words with the change that caused
+them ("PgBouncer default_pool_size 60 -> 25"), so text search misses it. M6 adds
+a retriever that works like an on-call engineer:
+
+1. find the services in the incident text (alias table generated from the
+   service registry; ambiguous names dropped);
+2. walk the dependency graph (both directions, shared infrastructure adjacent to
+   everything);
+3. score changes before the incident: `proximity(hops) * recency(days) * risk(type)`,
+   with a one-line explanation per suggestion;
+4. fuse with BM25 and dense via reciprocal rank fusion, weighting BM25 up for
+   identifier-heavy text.
+
+**Evaluation protocol.** 30 held-out incidents (`data/eval/scenarios_test.yaml`)
+were written and committed with their SHA-256 (`scenarios_test.lock`) before any
+M6 scoring code existed. They are adversarial: newer distractor changes, culprits
+1-2 hops from the symptoms, decoys whose words match the symptoms, changes dated
+after the incident, rolled-back changes, culprits older than the time window. The
+four parameters are grid-searched on the 10 dev incidents only; the test run
+checks the hash and refuses to run twice without `--rerun` (every run is logged).
+Pre-registered claim: on test, root-cause-change Recall@5 of the full system
+beats adaptive RRF, with a paired 95% bootstrap CI above 0. It is compared against
+a naive "newest change on the named services" baseline, not only against text search.
+
+**Limits.** The test set and the scorer share an author; freezing first and the
+adversarial cases reduce that bias but do not remove it. The data is synthetic and
+the service registry is complete, which real CMDBs rarely are. The approach is
+inspired by change-correlation features in incident-management tools; this
+implementation and its numbers are our own.

@@ -16,7 +16,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointIdsList,
+    PointStruct,
+    VectorParams,
+)
 
 from ragnition.core.providers import ModelGateway
 from ragnition.ingest.chunking import Chunk
@@ -122,7 +130,27 @@ async def build_collection(
             ],
         )
         progress(min(start + EMBED_BATCH, len(embedded)), len(embedded))
+    # Never trust delete_collection alone: in local mode on Windows it removes files with
+    # rmtree(ignore_errors=True) while SQLite still holds them open, and create_collection
+    # then reopens the OLD points. So remove every point that is not a current chunk.
+    keep = {point_id(c.chunk_id) for c in embedded}
+    stale = prune_stale_points(client, name, keep)
+    count = client.count(name, exact=True).count
+    if count != len(keep):
+        raise RuntimeError(f"{name}: {count} points after build, expected {len(keep)} (pruned {stale})")
     return len(embedded)
+
+
+def prune_stale_points(client: QdrantClient, name: str, keep: set[str]) -> int:
+    stale, offset = [], None
+    while True:
+        points, offset = client.scroll(name, limit=1024, offset=offset, with_payload=False, with_vectors=False)
+        stale += [p.id for p in points if str(p.id) not in keep]
+        if offset is None:
+            break
+    if stale:
+        client.delete(name, points_selector=PointIdsList(points=stale))
+    return len(stale)
 
 
 def dense_search(client: QdrantClient, name: str, vector: list[float], k: int,
