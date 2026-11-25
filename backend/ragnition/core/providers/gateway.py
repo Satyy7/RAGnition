@@ -172,6 +172,9 @@ class ModelGateway:
                 payload={"query": query, "documents": documents, "top_n": top_n},
                 call=call,
                 response_type=RerankResponse,
+                # Providers bill the query once per document (query-document pairs),
+                # ~4 chars/token. Lets a `tpm` limit throttle us before the provider does.
+                est_tokens=(sum(len(d) for d in documents) + len(query) * len(documents)) // 4,
                 use_cache=use_cache,
                 pin=pin,
             )

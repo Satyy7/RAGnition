@@ -138,9 +138,9 @@ def render_report(run: M7Run, prep: Prepared, setups: dict[str, RerankSetup], se
     lines.append(f"- PRIMARY: nDCG@10, `{sel}|slots` - `base` = **{p1.fmt()}** (n={n}) -> "
                  f"**{'SUPPORTED' if p1.lo > 0 else 'NOT supported'}**")
     n, p2 = _diff(run, system_name(sel, "naive"), "base", "rc_r5", resamples, seed)
-    lines.append(f"- PREDICTION: root-cause R@5, `{sel}|naive` - `base` = **{p2.fmt()}** (n={n}) -> prediction "
-                 f"{'held' if p2.mean < 0 else 'did NOT hold'}"
-                 f"{' (CI excludes 0)' if p2.hi < 0 else ' (CI includes 0)' if p2.mean < 0 else ''}")
+    verdict = ("held (CI excludes 0)" if p2.hi < 0 else
+               "direction held but NOT significant (CI includes 0)" if p2.mean < 0 else "did NOT hold")
+    lines.append(f"- PREDICTION: root-cause R@5, `{sel}|naive` - `base` = **{p2.fmt()}** (n={n}) -> {verdict}")
     lines += ["", "| comparison | metric | n | difference [95% CI] |", "|---|---|---:|---|"]
     for a, b, m in ((f"{sel}|slots", "base", "ndcg10"), (f"{sel}|blend", "base", "ndcg10"),
                     (f"{sel}|naive", "base", "ndcg10"), (f"{sel}|naive", "base", "rc_r5"),

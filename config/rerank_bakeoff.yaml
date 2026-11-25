@@ -1,0 +1,24 @@
+# Written by run_m7_benchmark.py --split dev --apply (DEV only).
+selected: bge-local
+setups:
+  bge-local:
+    reranker: local:BAAI/bge-reranker-base
+    method: slots
+    depth: 10
+    condense: true
+    blend_weight: 1.0
+    chosen_by: m7 dev grid 2026-11-25
+  jina-v3:
+    reranker: jina:jina-reranker-v3
+    method: slots
+    depth: 20
+    condense: false
+    blend_weight: 0.5
+    chosen_by: m7 dev grid 2026-11-25
+  cohere-3.5:
+    reranker: cohere:rerank-v3.5
+    method: slots
+    depth: 10
+    condense: false
+    blend_weight: 1.0
+    chosen_by: m7 dev grid 2026-11-25

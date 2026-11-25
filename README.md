@@ -213,3 +213,23 @@ nDCG@10 over M6 retrieval (plain RRF), paired 95% CI above 0; (2) prediction:
 naive reranking lowers root-cause Recall@5. Local is selected unless an API
 reranker beats it by 0.02 nDCG on dev. This is the second milestone scored on the
 frozen test set; its use is logged and counted in the report.
+
+**Result (test, 2026-11-25, 26 held-out incidents):**
+
+| system | root-cause R@5 | root-cause MRR | nDCG@10 | rerank time |
+|---|---:|---:|---:|---:|
+| no reranking (M6 retrieval) | 0.88 | 0.74 | 0.74 | - |
+| naive, bge-local / Jina / Cohere | 0.76 / 0.80 / 0.84 | 0.41 / 0.34 / 0.35 | 0.68 / 0.65 / 0.60 | 10.5 s / 0.8 s / 0.5 s |
+| slot-preserving, bge-local | 0.88 | 0.74 | 0.74 | 10.5 s |
+
+- Primary claim **not supported**: slot-preserving reranking changed nDCG by -0.002
+  (CI [-0.005, 0.001]). It is safe, but it adds nothing.
+- Prediction: naive reranking lowered root-cause R@5 with all three rerankers, but
+  not significantly (bge: -0.12, CI [-0.28, 0.04]). The rank damage is larger: root-cause
+  MRR roughly halves for every reranker (exploratory, not the pre-registered metric).
+- Mistake in the pre-registration: it asked only for a CI above 0, not a minimum
+  useful effect. On dev, +0.003 nDCG counted as "supported"; the test result
+  shows it was noise.
+- **Decision:** the ranking step is not reranked (`config/rerank.yaml`, `method: none`).
+  The reranker is reused in M8 to choose passages *inside* documents already
+  selected, where text relevance is the right test.

@@ -1,0 +1,12 @@
+# Production setting for the incident ranking step (IncidentRetriever).
+# M7 test (2026-11-25, held-out): no reranking method improved ranking (slot-preserving
+# nDCG -0.002; naive reranking halved root-cause MRR with every reranker), while costing
+# 0.5-10 s per incident. So ranking is NOT reranked. The tuned settings below are kept
+# for reference; config/rerank_bakeoff.yaml has all three rerankers. M8 reuses the
+# reranker inside documents (passage selection), where text relevance is the right test.
+reranker: local:BAAI/bge-reranker-base
+method: none
+depth: 10
+condense: true
+blend_weight: 1.0
+chosen_by: m7 test 2026-11-25 (rejected for ranking)

@@ -41,6 +41,20 @@ def count_lines(path) -> int:
     return len(path.read_text(encoding="utf-8").splitlines()) if path.exists() else 0
 
 
+async def rerank_patiently(gw: ModelGateway, query: str, docs: list[str], slot: str, max_waits: int = 10):
+    """Batch job: on a rate limit, wait for the window to reset instead of failing."""
+    for attempt in range(1, max_waits + 1):
+        try:
+            return await gw.rerank(query, docs, pin=slot, degrade=False)
+        except AllProvidersExhausted as exc:
+            if attempt == max_waits:
+                raise
+            wait = max(exc.retry_in_s or 0, 30)
+            print(f"\n  {slot} rate-limited; waiting {wait:.0f}s (attempt {attempt}/{max_waits})")
+            await asyncio.sleep(wait)
+    raise AssertionError("unreachable")
+
+
 async def smoke(gw: ModelGateway, rerankers: list[str]) -> list[str]:
     bad = []
     for short in rerankers:
@@ -115,7 +129,7 @@ async def main(split: str, apply: bool, rerun: bool, rerankers: list[str]) -> in
                     inc = s.incident
                     query = (condense_incident(s.title, inc.reporter_note, inc.alerts, inc.logs) if condense
                              else incident_query(s))
-                    resp = await gw.rerank(query, [g.passages[d] for d in head], pin=RERANKERS[short], degrade=False)
+                    resp = await rerank_patiently(gw, query, [g.passages[d] for d in head], RERANKERS[short])
                     prep.scores[(short, condense)][s.id] = {head[r.index]: r.score for r in resp.results}
                     prep.latency_ms[short].append(resp.latency_ms)
             print()

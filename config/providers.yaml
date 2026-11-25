@@ -74,7 +74,8 @@ chains:
   # (jina.ai/models). If every reranker fails we return the fused order, degraded=true.
   rerank:
     - { provider: local, model: BAAI/bge-reranker-base, cache: false }
-    - { provider: jina, model: jina-reranker-v3, rpm: 60, timeout_s: 30 }
+    # Jina free tier: 100k tokens/min (seen 2026-11-25); one 30-passage call is ~11k.
+    - { provider: jina, model: jina-reranker-v3, rpm: 60, tpm: 80000, timeout_s: 30 }
     - { provider: cohere, model: rerank-v3.5, rpm: 10, timeout_s: 30 }
 
 resilience:
