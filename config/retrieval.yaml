@@ -1,0 +1,4 @@
+# Written by scripts/run_retrieval_benchmark.py --apply. See data/eval/results/.
+config: fixed-510
+query_instruction: true
+chosen_by: m5 benchmark 2026-11-24

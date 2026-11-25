@@ -13,18 +13,21 @@ import json
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
 from ragnition.core.providers import ModelGateway
 from ragnition.ingest.chunking import Chunk
+from ragnition.retrieval.embed_cache import EmbeddingCache, text_key
 
 EMBED_BATCH = 256  # per gateway call (the gateway batches further by batch_size)
 
 
-def collection_name(strategy: str) -> str:
-    return f"chunks_{strategy}"
+def collection_name(config_id: str) -> str:
+    """'structure-384' -> 'chunks_structure_384'."""
+    return "chunks_" + config_id.replace("-", "_")
 
 
 def point_id(chunk_id: str) -> str:
@@ -63,9 +66,41 @@ def build_filter(doc_type: str | None = None, tag: str | None = None) -> Filter 
     return Filter(must=must) if must else None
 
 
+async def embed_passages(gw: ModelGateway, texts: list[str], model: str, cache: EmbeddingCache | None) -> list[list[float]]:
+    """Embed passages, reusing cached vectors for texts already embedded by `model`."""
+    keys = [text_key(model, t) for t in texts]
+    # `is not None`, not truthiness: an EMPTY cache has len 0 and would count as False.
+    known = cache.get_many(keys) if cache is not None else {}
+    missing = [i for i, k in enumerate(keys) if k not in known]
+    if missing:
+        resp = await gw.embed([texts[i] for i in missing], input_type="document", use_cache=False)
+        fresh = {keys[i]: v for i, v in zip(missing, resp.vectors, strict=True)}
+        if cache is not None:
+            cache.put_many(fresh)
+        known |= fresh
+    return [known[k] for k in keys]
+
+
+def seed_cache_from_collection(client: QdrantClient, name: str, texts_by_chunk: dict[str, str], model: str,
+                               cache: EmbeddingCache) -> int:
+    """Copy vectors out of an existing collection into the cache (no re-embedding)."""
+    if not client.collection_exists(name):
+        return 0
+    seeded, offset = 0, None
+    while True:
+        points, offset = client.scroll(name, limit=512, offset=offset, with_payload=["chunk_id"], with_vectors=True)
+        batch = {text_key(model, texts_by_chunk[p.payload["chunk_id"]]): list(p.vector)
+                 for p in points if p.payload["chunk_id"] in texts_by_chunk}
+        cache.put_many(batch)
+        seeded += len(batch)
+        if offset is None:
+            return seeded
+
+
 async def build_collection(
     client: QdrantClient, gw: ModelGateway, name: str, chunks: list[Chunk], dimensions: int,
     progress: Callable[[int, int], None] = lambda done, total: None,
+    *, model: str = "", cache: EmbeddingCache | None = None,
 ) -> int:
     """(Re)create the collection and embed every searchable chunk (parents excluded)."""
     if client.collection_exists(name):
@@ -74,7 +109,7 @@ async def build_collection(
     embedded = [c for c in chunks if c.role != "parent"]
     for start in range(0, len(embedded), EMBED_BATCH):
         batch = embedded[start : start + EMBED_BATCH]
-        resp = await gw.embed([c.text for c in batch], input_type="document", use_cache=False)
+        resp = SimpleNamespace(vectors=await embed_passages(gw, [c.text for c in batch], model, cache))
         client.upsert(
             collection_name=name,
             points=[

@@ -20,8 +20,9 @@ PROCESSED_DIR = DATA_DIR / "processed"
 MIN_PUBLIC_WORDS = 150  # below this a fetched page is usually an error/login/consent page
 
 
-def chunks_path(strategy: Strategy, out_dir: Path = PROCESSED_DIR) -> Path:
-    return out_dir / f"chunks.{strategy}.jsonl"
+def chunks_path(name: str, out_dir: Path = PROCESSED_DIR) -> Path:
+    """`name` is an experiment config id such as 'structure-384'."""
+    return out_dir / f"chunks.{name}.jsonl"
 
 
 @dataclass
@@ -75,7 +76,7 @@ def dedup(chunks: list[Chunk]) -> tuple[list[Chunk], int]:
 
 @dataclass
 class ChunkReport:
-    strategy: Strategy
+    name: str
     docs: int
     chunks: int
     parents: int
@@ -89,13 +90,15 @@ class ChunkReport:
 
 
 def run_strategy(parsed: ParseResult, strategy: Strategy, count: TokenCounter,
-                 cfg: ChunkConfig = ChunkConfig(), out_dir: Path = PROCESSED_DIR) -> ChunkReport:
+                 cfg: ChunkConfig = ChunkConfig(), out_dir: Path = PROCESSED_DIR,
+                 name: str | None = None) -> ChunkReport:
+    name = name or strategy
     all_chunks: list[Chunk] = []
     for meta, doc in parsed.docs:
         all_chunks.extend(chunk_document(doc, meta, strategy, count, cfg))
     chunks, dropped = dedup(all_chunks)
 
-    out = chunks_path(strategy, out_dir)
+    out = chunks_path(name, out_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
@@ -109,7 +112,7 @@ def run_strategy(parsed: ParseResult, strategy: Strategy, count: TokenCounter,
     for c in embedded:
         by_type[c.doc_type] = by_type.get(c.doc_type, 0) + 1
     return ChunkReport(
-        strategy=strategy, docs=len(parsed.docs), chunks=len(embedded),
+        name=name, docs=len(parsed.docs), chunks=len(embedded),
         parents=sum(c.role == "parent" for c in chunks), duplicates_dropped=dropped,
         token_min=sizes[0], token_median=statistics.median(sizes),
         token_p95=sizes[min(len(sizes) - 1, int(0.95 * len(sizes)))], token_max=sizes[-1],

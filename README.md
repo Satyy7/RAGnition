@@ -111,3 +111,20 @@ Docker; one process at a time). BM25 is implemented in
 `backend/ragnition/retrieval/bm25.py` with an identifier-aware tokenizer
 (`default_pool_size` is indexed whole and as `default`, `pool`, `size`) and is
 rebuilt in memory when a `Retriever` opens.
+
+## Retrieval benchmark (M5)
+
+```powershell
+uv run python scripts/generate_retrieval_queries.py     # ~200 queries, judge-filtered
+uv run python scripts/chunk_corpus.py                   # all 8 configs in config/experiments.yaml
+uv run python scripts/build_index.py                    # embeds only text not seen before
+uv run python scripts/run_retrieval_benchmark.py --apply
+```
+
+Eight chunking configs (fixed / structure / parent-child at several sizes) are
+compared with dense search (with and without BGE's query instruction) and BM25
+on judge-checked synthetic queries plus the hand-labelled incidents. Results carry
+95% bootstrap confidence intervals, and the winner is picked by a rule fixed
+before the run: highest combined dense+BM25 Recall@10, and among statistically
+tied configs the one with the fewest vectors. The choice is written to
+`config/retrieval.yaml`; reports are in `data/eval/results/`.

@@ -1,0 +1,21 @@
+# M5 retrieval benchmark grid. Each config is chunked, embedded and indexed once
+# (fingerprints + embedding cache make re-runs cheap).
+# Sizes are in BGE tokens, header included; 510 = the model limit (512 minus [CLS]/[SEP]).
+
+configs:
+  - {id: fixed-256, strategy: fixed, size: 256, overlap: 48}
+  - {id: fixed-384, strategy: fixed, size: 384, overlap: 64}
+  - {id: fixed-510, strategy: fixed, size: 510, overlap: 80}
+  - {id: structure-256, strategy: structure, size: 256}
+  - {id: structure-384, strategy: structure, size: 384}
+  - {id: structure-510, strategy: structure, size: 510}
+  - {id: parent_child-128, strategy: parent_child, child_size: 128, parent_size: 1024}
+  - {id: parent_child-256, strategy: parent_child, child_size: 256, parent_size: 1024}
+
+# BGE v1.5 model card recommends this prefix for short retrieval queries. Whether
+# fastembed already adds it is not documented clearly, so we MEASURE both variants.
+query_instruction: "Represent this sentence for searching relevant passages: "
+
+bootstrap:
+  resamples: 2000
+  seed: 7

@@ -59,11 +59,12 @@ class Retriever:
         self.bm25 = BM25Index([c.chunk_id for c in self.searchable], [c.text for c in self.searchable])
 
     @classmethod
-    def open(cls, strategy: str, gw: ModelGateway, client: QdrantClient | None = None) -> Retriever:
+    def open(cls, config_id: str, gw: ModelGateway, client: QdrantClient | None = None) -> Retriever:
+        """`config_id` is an experiment config such as 'structure-384'."""
         client = client or QdrantClient(path=str(QDRANT_DIR))
-        if not client.collection_exists(collection_name(strategy)):
-            raise RuntimeError(f"no index for '{strategy}': run scripts/build_index.py first")
-        return cls(strategy, load_chunks(chunks_path(strategy)), client, gw)
+        if not client.collection_exists(collection_name(config_id)):
+            raise RuntimeError(f"no index for '{config_id}': run scripts/build_index.py first")
+        return cls(config_id, load_chunks(chunks_path(config_id)), client, gw)
 
     def parent(self, chunk: Chunk) -> Chunk | None:
         return self.by_id.get(chunk.parent_id) if chunk.parent_id else None
@@ -73,6 +74,11 @@ class Retriever:
 
     async def dense(self, query: str, k: int = 10, doc_type: str | None = None, tag: str | None = None) -> list[Hit]:
         vector = (await self.gw.embed([query], input_type="query")).vectors[0]
+        return self.dense_by_vector(vector, k, doc_type, tag)
+
+    def dense_by_vector(self, vector: list[float], k: int = 10, doc_type: str | None = None,
+                        tag: str | None = None) -> list[Hit]:
+        """Search with a precomputed query vector (the benchmark embeds each query once)."""
         pairs = dense_search(self.client, collection_name(self.strategy), vector, k, build_filter(doc_type, tag))
         return self._hits(pairs, "dense")
 

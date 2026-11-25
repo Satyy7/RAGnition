@@ -22,5 +22,14 @@ def reciprocal_rank(ranked_docs: list[str], relevant: set[str]) -> float:
     return 0.0
 
 
+def ndcg_at_k(ranked_docs: list[str], relevant: set[str], k: int) -> float:
+    """Binary-relevance nDCG: every relevant doc counts, discounted by log2(rank + 1)."""
+    import math
+
+    dcg = sum(1 / math.log2(i + 1) for i, d in enumerate(ranked_docs[:k], start=1) if d in relevant)
+    ideal = sum(1 / math.log2(i + 1) for i in range(1, min(len(relevant), k) + 1))
+    return dcg / ideal if ideal else 0.0
+
+
 def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
