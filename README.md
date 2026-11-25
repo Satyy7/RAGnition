@@ -190,3 +190,26 @@ adversarial cases reduce that bias but do not remove it. The data is synthetic a
 the service registry is complete, which real CMDBs rarely are. The approach is
 inspired by change-correlation features in incident-management tools; this
 implementation and its numbers are our own.
+
+## Reranking (M7)
+
+```powershell
+uv run python scripts/run_m7_benchmark.py --split dev --apply   # bake-off + tuning on dev
+uv run python scripts/run_m7_benchmark.py --split test          # one test run
+```
+
+A cross-encoder judges whether a passage's *text* answers the query. That suits
+postmortems, runbooks and docs, but not change records, whose wording rarely
+matches the symptoms. Three ways of applying a reranker to the fused top-N are
+compared: **naive** (reorder everything), **blend** (RRF of fused and reranked
+order) and **slot-preserving** (change records keep their change-aware positions;
+the reranker reorders only the explanatory evidence into the remaining slots).
+Rerankers: local `BAAI/bge-reranker-base`, Jina `jina-reranker-v3`, Cohere
+`rerank-v3.5`. Long incidents are condensed (alerts and error lines first,
+near-duplicate log lines removed) to fit the cross-encoder's ~512-token input.
+
+Pre-registered before any M7 run: (1) slot-preserving reranking improves graded
+nDCG@10 over M6 retrieval (plain RRF), paired 95% CI above 0; (2) prediction:
+naive reranking lowers root-cause Recall@5. Local is selected unless an API
+reranker beats it by 0.02 nDCG on dev. This is the second milestone scored on the
+frozen test set; its use is logged and counted in the report.

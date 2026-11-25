@@ -155,8 +155,11 @@ class ModelGateway:
         )
 
     async def rerank(
-        self, query: str, documents: list[str], *, top_n: int | None = None, use_cache: bool = True
+        self, query: str, documents: list[str], *, top_n: int | None = None, use_cache: bool = True,
+        pin: str | None = None, degrade: bool = True,
     ) -> RerankResponse:
+        """`pin` forces one reranker (benchmarks). `degrade=False` raises instead of
+        silently returning the input order, so a benchmark can never score a passthrough."""
         n = len(documents) if top_n is None else min(top_n, len(documents))
         if not documents:
             return RerankResponse(results=[], provider="none", model="none")
@@ -170,8 +173,11 @@ class ModelGateway:
                 call=call,
                 response_type=RerankResponse,
                 use_cache=use_cache,
+                pin=pin,
             )
         except AllProvidersExhausted as exc:
+            if not degrade:
+                raise
             # Graceful degradation: the caller keeps its fused (pre-rerank) order and
             # the trace says so. Better a slightly worse answer than no answer.
             logger.warning("rerank degraded to passthrough", extra={"reason": str(exc)})

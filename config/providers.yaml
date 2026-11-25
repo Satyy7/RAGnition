@@ -67,11 +67,15 @@ chains:
   embedding:
     - { provider: local, model: BAAI/bge-base-en-v1.5, dimensions: 768, batch_size: 64, cache: false }
 
-  # Local cross-encoder: no quota, reproducible, MIT-licensed. If it fails we
-  # return the fused order marked degraded=true. Jina / Cohere stay defined above
-  # for the M9 local-vs-API comparison.
+  # Local cross-encoder first: no quota, reproducible, MIT-licensed, data stays on
+  # the machine. The API rerankers are fallbacks and the M7 bake-off contenders
+  # (benchmarks pin each one). IDs checked 2026-11-25 against provider docs:
+  # Cohere `rerank-v3.5` (docs.cohere.com/v2/docs/rerank), Jina `jina-reranker-v3`
+  # (jina.ai/models). If every reranker fails we return the fused order, degraded=true.
   rerank:
     - { provider: local, model: BAAI/bge-reranker-base, cache: false }
+    - { provider: jina, model: jina-reranker-v3, rpm: 60, timeout_s: 30 }
+    - { provider: cohere, model: rerank-v3.5, rpm: 10, timeout_s: 30 }
 
 resilience:
   max_retries_per_model: 1      # retries on the SAME model; more just delays failover
